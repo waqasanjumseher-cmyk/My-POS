@@ -1,4 +1,4 @@
-<!DOCTYPE html> 
+<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8" />
@@ -528,6 +528,72 @@ function recordAuditLog(actionType, details, username) {
   saveJSON(AUDIT_LOG_KEY, log.slice(0, 200)); // keep the most recent 200 entries only
 }
 
+/* ============================ LICENSING & SUBSCRIPTION (Free vs. Premium) ============================
+   Zahidy Mobiles ships as one build with every screen present; a locally-stored `isPremium` flag
+   decides whether Premium-only modules actually run or fall back to a locked "Upgrade" prompt.
+   There is no license server here (this is a single portable HTML file with no backend) — keys
+   are validated locally with a deterministic checksum, the same pattern a lot of offline desktop
+   software uses for activation. A real deployment could swap `isValidLicenseKey` for a call to a
+   licensing API without touching anything else, since every gate below only reads `isPremium`.
+
+   Key format: ZM-XXXX-XXXX-CCCC, where CCCC is a checksum of the two preceding 4-character groups.
+   Demo/testing key (always valid): ZM-PREM-2026-01LR
+   ---------------------------------------------------------------------------------------------- */
+const LICENSE_KEY_STORAGE = "customSettings_license";
+// Free plan limits — customize freely; Premium has no cap.
+const FREE_PLAN_LIMITS = { maxInventoryItems: 50 };
+/* Registry of every Premium-gated capability, used to render the Free-vs-Premium comparison and
+   the "custom upgrade prompt" shown wherever a locked feature is clicked. Add an entry here any
+   time a new module should become Premium-only — every gate in the app looks features up by id. */
+const PREMIUM_FEATURES = {
+  installments: { label: "Installment Management", ur: "قسط پر فروخت اور وصولی", note: "Sell on installments, generate payment plans, and track recovery schedules." },
+  advancedReports: { label: "Advanced PDF/Excel Reports", ur: "پی ڈی ایف/ایکسل رپورٹس", note: "Export formatted, presentation-ready PDF and Excel reports for every module." },
+  whatsappImageReceipts: { label: "WhatsApp Image Receipts", ur: "واٹس ایپ تصویری رسید", note: "Branded, image-based receipts & payment reminders shared straight to WhatsApp." },
+  multiAccountProfitLoss: { label: "Multi-Account Profit/Loss", ur: "ملٹی اکاؤنٹ نفع نقصان", note: "Partner management with profit/loss allocation tracked across multiple accounts." },
+  cloudSync: { label: "Cloud Sync", ur: "کلاؤڈ سنک", note: "Live backup and sync of your business data across every device." },
+  inventoryLimit: { label: "Unlimited Inventory", ur: "لامحدود انوینٹری", note: "The Free plan is capped at " + FREE_PLAN_LIMITS.maxInventoryItems + " inventory items — upgrade for unlimited stock." },
+};
+function defaultLicenseState() { return { isPremium: false, key: "", activatedAt: null, source: null }; }
+/* Read fresh in every gated component's render (same convention as loadFeatureToggles() elsewhere
+   in this file) so activating/removing a license in Settings takes effect the moment that screen
+   or tab re-renders — no extra plumbing or context provider needed. */
+function loadLicenseState() { return { ...defaultLicenseState(), ...loadJSON(LICENSE_KEY_STORAGE, {}) }; }
+function saveLicenseState(state) { saveJSON(LICENSE_KEY_STORAGE, state); }
+function normalizeLicenseKeyInput(raw) { return (raw || "").trim().toUpperCase().replace(/\s+/g, ""); }
+function licenseChecksumSegment(body) {
+  let sum = 0;
+  for (let i = 0; i < body.length; i++) sum += body.charCodeAt(i) * (i + 1);
+  return sum.toString(36).toUpperCase().padStart(4, "0").slice(-4);
+}
+function isValidLicenseKey(raw) {
+  const key = normalizeLicenseKeyInput(raw);
+  const m = /^ZM-([A-Z0-9]{4})-([A-Z0-9]{4})-([A-Z0-9]{4})$/.exec(key);
+  if (!m) return false;
+  const [, g1, g2, cs] = m;
+  return licenseChecksumSegment(g1 + g2) === cs;
+}
+function activateLicenseKey(raw) {
+  const key = normalizeLicenseKeyInput(raw);
+  if (!isValidLicenseKey(key)) return { ok: false, error: "That license key isn't valid. Double-check it and try again." };
+  const state = { isPremium: true, key, activatedAt: new Date().toISOString(), source: "key" };
+  saveLicenseState(state);
+  return { ok: true, state };
+}
+function deactivateLicense() { const state = defaultLicenseState(); saveLicenseState(state); return state; }
+/* Admin/Developer Master Control — lets an Admin flip any account between Free and Premium
+   instantly from the app UI, bypassing key entry entirely (for QA/testing or direct client
+   management). Writes to the exact same LICENSE_KEY_STORAGE record as a real key activation, so
+   every existing gate (which only ever reads isPremium) keeps working unchanged; `source` just
+   remembers how the current state got there so Settings can show "Admin Override" vs a real key. */
+function setLicenseOverride(nextIsPremium) {
+  const current = loadLicenseState();
+  const state = nextIsPremium
+    ? { isPremium: true, key: current.source === "key" ? current.key : "ADMIN-OVERRIDE", activatedAt: new Date().toISOString(), source: "admin_override" }
+    : { isPremium: false, key: "", activatedAt: new Date().toISOString(), source: "admin_override" };
+  saveLicenseState(state);
+  return state;
+}
+
 function defaultUiPrefs() {
   const tabs = {}; TABS.forEach(t => { tabs[t.id] = true; });
   const dashboard = {}; DASHBOARD_CARDS.forEach(c => { dashboard[c.id] = true; });
@@ -992,9 +1058,11 @@ function mergeUsersFromCloud(local, remote) {
 function useCloudSync(bizId, data, setData, cloudUser) {
   const pushTimer = useRef(null);
   const lastPushedJSON = useRef(null);
-  const [status, setStatus] = useState({ state: CLOUD_ENABLED ? "connecting" : "disabled", lastSyncedAt: null });
+  const isPremium = loadLicenseState().isPremium; // Cloud Sync is a Premium-only module
+  const [status, setStatus] = useState({ state: CLOUD_ENABLED && isPremium ? "connecting" : "disabled", lastSyncedAt: null });
 
   useEffect(() => {
+    if (!isPremium) { setStatus({ state: "locked", lastSyncedAt: null }); return; }
     if (!CLOUD_ENABLED) { setStatus({ state: "disabled", lastSyncedAt: null }); return; }
     if (!cloudUser || !bizId) { setStatus(s => ({ ...s, state: "signed-out" })); return; }
     setStatus(s => ({ ...s, state: "connecting" }));
@@ -1016,10 +1084,10 @@ function useCloudSync(bizId, data, setData, cloudUser) {
       setStatus({ state: "synced", lastSyncedAt: new Date().toISOString() });
     }, (err) => { console.warn("Cloud sync (listen) failed:", err.message); setStatus(s => ({ ...s, state: "error" })); });
     return () => unsub();
-  }, [bizId, cloudUser]);
+  }, [bizId, cloudUser, isPremium]);
 
   useEffect(() => {
-    if (!CLOUD_ENABLED || !fbDb || !cloudUser || !bizId) return;
+    if (!isPremium || !CLOUD_ENABLED || !fbDb || !cloudUser || !bizId) return;
     const json = JSON.stringify(data);
     if (json === lastPushedJSON.current) return; // nothing changed since last sync
     setStatus(s => ({ ...s, state: navigator.onLine ? "syncing" : "offline-queued" }));
@@ -1874,7 +1942,8 @@ function SyncStatusBadge({ isOnline, cloudStatus, compact }) {
   }
   let label, dotClass;
   const st = cloudStatus.state;
-  if (st === "signed-out") { label = "Saved on this device \u2014 sign in to sync to cloud"; dotClass = "bg-slate-400"; }
+  if (st === "locked") { label = "Saved on this device \u2014 Cloud Sync is a Premium feature"; dotClass = "bg-slate-400"; }
+  else if (st === "signed-out") { label = "Saved on this device \u2014 sign in to sync to cloud"; dotClass = "bg-slate-400"; }
   else if (st === "offline-queued" || (!isOnline && st === "syncing")) { label = "Offline \u2014 changes queued, will sync automatically"; dotClass = "bg-amber-500"; }
   else if (st === "syncing" || st === "connecting") { label = "Syncing to cloud..."; dotClass = "bg-amber-500 animate-pulse"; }
   else if (st === "synced") { label = "All changes saved to cloud" + (cloudStatus.lastSyncedAt ? " \u00b7 " + relativeTime(cloudStatus.lastSyncedAt) : ""); dotClass = "bg-emerald-500"; }
@@ -2069,6 +2138,49 @@ function Card({ label, ur, value, sub, accent }) {
       <div className="text-xs uppercase tracking-wide text-slate-500">{label} {ur ? <span className="urdu normal-case">/ {ur}</span> : null}</div>
       <div className={"text-2xl font-bold mt-1 " + (accent || "text-slate-800")}>{value}</div>
       {sub ? <div className="text-xs text-slate-400 mt-1">{sub}</div> : null}
+    </div>
+  );
+}
+
+/* ============================ PREMIUM / UPGRADE UI ============================
+   Shared across every Premium-gated module. `featureId` must be a key in PREMIUM_FEATURES. */
+function UpgradeModal({ featureId, onClose }) {
+  const f = PREMIUM_FEATURES[featureId] || { label: "This feature", note: "This is a Premium feature." };
+  return (
+    <Modal title={"\u{1F512} " + f.label + " is a Premium feature"} ur={f.ur} onClose={onClose}>
+      <p className="text-sm text-slate-600 mb-3">{f.note}</p>
+      <div className="bg-amber-50 border border-amber-200 rounded-lg px-3 py-2.5 text-xs text-amber-800 mb-4">
+        Upgrade to Zahidy Mobiles Premium to unlock this and every other Premium module — Installments,
+        Advanced PDF/Excel Reports, WhatsApp Image Receipts, Multi-Account Profit/Loss, and Cloud Sync.
+      </div>
+      <p className="text-xs text-slate-500 mb-4">Have a license key? Go to <b>Settings &rarr; License &amp; Subscription</b> to activate it.</p>
+      <div className="flex justify-end"><button onClick={onClose} className="px-4 py-2 text-sm rounded-lg bg-slate-800 hover:bg-slate-900 text-white">Got it</button></div>
+    </Modal>
+  );
+}
+/* Small inline pill used next to a locked control (button/option) so free users can see — and
+   click straight into — the upgrade prompt without guessing why something is unavailable. */
+function PremiumLockBadge({ onClick, label }) {
+  return (
+    <button type="button" onClick={onClick} title="Premium feature" className="inline-flex items-center gap-1 bg-amber-100 hover:bg-amber-200 text-amber-800 text-[11px] font-medium px-2 py-1 rounded-lg">
+      <span>&#128274;</span>{label || "Premium"}
+    </button>
+  );
+}
+/* Wraps an entire tab/section: renders `children` untouched when Premium, otherwise a locked
+   placeholder card (with its own Upgrade button) instead of the real content. Use this for
+   modules that are Premium-only end-to-end (e.g. Partner Management & Profit/Loss). */
+function PremiumGate({ featureId, isPremium, children }) {
+  const [showUpgrade, setShowUpgrade] = useState(false);
+  if (isPremium) return children;
+  const f = PREMIUM_FEATURES[featureId] || { label: "This feature", note: "" };
+  return (
+    <div className="bg-white rounded-xl border border-dashed border-amber-300 p-8 text-center max-w-xl">
+      <div className="text-3xl mb-2">&#128274;</div>
+      <h3 className="text-sm font-semibold text-slate-800 mb-1">{f.label} is a Premium feature</h3>
+      <p className="text-xs text-slate-500 mb-4">{f.note}</p>
+      <button onClick={() => setShowUpgrade(true)} className="bg-amber-600 hover:bg-amber-700 text-white text-sm font-medium px-4 py-2 rounded-lg">Unlock with Premium</button>
+      {showUpgrade && <UpgradeModal featureId={featureId} onClose={() => setShowUpgrade(false)} />}
     </div>
   );
 }
@@ -2425,6 +2537,9 @@ function InventoryTab({ data, setData, role, dealers, can }) {
   const [item, setItem] = useState(blankItem());
   const [imeiError, setImeiError] = useState("");
   const [showSummary, setShowSummary] = useState(false);
+  const [showUpgrade, setShowUpgrade] = useState(false);
+  const isPremium = loadLicenseState().isPremium;
+  const atFreeLimit = !isPremium && data.inventory.length >= FREE_PLAN_LIMITS.maxInventoryItems;
 
   const filtered = useMemo(() => {
     const q = query.trim().toLowerCase();
@@ -2441,7 +2556,10 @@ function InventoryTab({ data, setData, role, dealers, can }) {
   const stockSummary = useMemo(() => buildStockSummary(filtered), [filtered]);
 
   const itemDirty = useDirty(item, showForm);
-  function openAdd() { setItem(blankItem()); setEditing(null); setImeiError(""); setShowForm(true); }
+  function openAdd() {
+    if (atFreeLimit) { setShowUpgrade(true); return; }
+    setItem(blankItem()); setEditing(null); setImeiError(""); setShowForm(true);
+  }
   function openEdit(it) { setItem({ ...blankItem(), ...it, accessories: { ...blankItem().accessories, ...it.accessories } }); setEditing(it.id); setImeiError(""); setShowForm(true); }
   function submit() {
     if (!item.itemName.trim()) { alert("Item Name is required"); return; }
@@ -2479,9 +2597,15 @@ function InventoryTab({ data, setData, role, dealers, can }) {
         <h2 className="text-lg font-semibold text-slate-800"><Bi en="Inventory" ur="اسٹاک" /></h2>
         <div className="flex flex-wrap gap-2">
           <button onClick={() => setShowSummary(s => !s)} className="bg-slate-100 hover:bg-slate-200 text-slate-700 text-sm font-medium px-4 py-2 rounded-lg">{showSummary ? "Hide" : "\u{1F4CA} Show"} Stock Summary</button>
-          {canAdd && <button onClick={openAdd} className="bg-[var(--accent-600)] hover:bg-[var(--accent-700)] text-white text-sm font-medium px-4 py-2 rounded-lg">+ Add Item / نیا آئٹم</button>}
+          {canAdd && <button onClick={openAdd} className={"text-white text-sm font-medium px-4 py-2 rounded-lg " + (atFreeLimit ? "bg-amber-600 hover:bg-amber-700" : "bg-[var(--accent-600)] hover:bg-[var(--accent-700)]")}>{atFreeLimit ? "\u{1F512} " : "+ "}Add Item / نیا آئٹم</button>}
         </div>
       </div>
+      {!isPremium && (
+        <div className={"text-xs rounded-lg px-3 py-2 mb-4 border " + (atFreeLimit ? "bg-amber-50 border-amber-200 text-amber-800" : "bg-slate-50 border-slate-200 text-slate-500")}>
+          Free Plan: {data.inventory.length} / {FREE_PLAN_LIMITS.maxInventoryItems} inventory items used.
+          {atFreeLimit && <button onClick={() => setShowUpgrade(true)} className="ml-2 underline font-medium">Upgrade to Premium for unlimited inventory</button>}
+        </div>
+      )}
       <BusinessTypeQuickSwitcher />
       <div className="flex flex-wrap gap-2 mb-4">
         <TextInput placeholder="Search name, model, IMEI 1/2..." value={query} onChange={e => setQuery(e.target.value)} className="max-w-xs" />
@@ -2594,6 +2718,7 @@ function InventoryTab({ data, setData, role, dealers, can }) {
           <ConfirmBar onCancel={() => setDeleting(null)} onConfirm={doDelete} />
         </Modal>
       )}
+      {showUpgrade && <UpgradeModal featureId="inventoryLimit" onClose={() => setShowUpgrade(false)} />}
     </div>
   );
 }
@@ -3054,6 +3179,8 @@ function InstallmentPanel({ data, setData, sale, biz, currentUserName, can }) {
   const [viewingPhoto, setViewingPhoto] = useState("");
   const [showImageReceipt, setShowImageReceipt] = useState(false);
   const [showImageReminder, setShowImageReminder] = useState(false);
+  const [showUpgrade, setShowUpgrade] = useState(false);
+  const isPremium = loadLicenseState().isPremium;
   const pdfNodeRef = useRef(null);
 
   function submitPayment() {
@@ -3094,11 +3221,16 @@ function InstallmentPanel({ data, setData, sale, biz, currentUserName, can }) {
         {credit.remaining > 0 && canAdd && <button onClick={() => { setEditingPaymentId(null); setShowPay(!showPay); setPayPhoto(""); }} className="bg-[var(--accent-600)] text-white text-xs px-3 py-1.5 rounded-lg">Record Payment</button>}
         {credit.remaining > 0 && canAdd && <button onClick={() => setShowDiscount(!showDiscount)} className="bg-slate-600 text-white text-xs px-3 py-1.5 rounded-lg">Grant Discount / Waiver</button>}
         {loadFeatureToggles().enableWhatsAppShare && waReceiptLink && <a href={waReceiptLink} target="_blank" rel="noreferrer" className="bg-emerald-600 text-white text-xs px-3 py-1.5 rounded-lg no-underline">WhatsApp Receipt</a>}
-        {loadFeatureToggles().enableWhatsAppShare && <button onClick={() => setShowImageReceipt(true)} className="bg-emerald-700 text-white text-xs px-3 py-1.5 rounded-lg">WhatsApp Image Receipt</button>}
+        {loadFeatureToggles().enableWhatsAppShare && (isPremium
+          ? <button onClick={() => setShowImageReceipt(true)} className="bg-emerald-700 text-white text-xs px-3 py-1.5 rounded-lg">WhatsApp Image Receipt</button>
+          : <PremiumLockBadge label="WhatsApp Image Receipt" onClick={() => setShowUpgrade("whatsappImageReceipts")} />)}
         <button onClick={() => printReceiptNode(pdfNodeRef.current, "Receipt " + (sale.invoiceId || ""))} className="bg-slate-800 text-white text-xs px-3 py-1.5 rounded-lg">Print / Save PDF</button>
         {loadFeatureToggles().enablePaymentReminders && credit.remaining > 0 && waReminderLink && <a href={waReminderLink} target="_blank" rel="noreferrer" className="bg-amber-600 text-white text-xs px-3 py-1.5 rounded-lg no-underline">WhatsApp Reminder</a>}
-        {loadFeatureToggles().enablePaymentReminders && credit.remaining > 0 && <button onClick={() => setShowImageReminder(true)} className="bg-amber-700 text-white text-xs px-3 py-1.5 rounded-lg">WhatsApp Image Reminder</button>}
+        {loadFeatureToggles().enablePaymentReminders && credit.remaining > 0 && (isPremium
+          ? <button onClick={() => setShowImageReminder(true)} className="bg-amber-700 text-white text-xs px-3 py-1.5 rounded-lg">WhatsApp Image Reminder</button>
+          : <PremiumLockBadge label="WhatsApp Image Reminder" onClick={() => setShowUpgrade("whatsappImageReceipts")} />)}
       </div>
+      {showUpgrade && <UpgradeModal featureId={showUpgrade} onClose={() => setShowUpgrade(false)} />}
       {/* Off-screen, always-rendered ReceiptDesign so "Print / Save PDF" above stays a single click —
           it prints this exact branded node's markup instead of a separate plain template. */}
       <div style={{ position: "fixed", top: 0, left: "-99999px", zIndex: -1 }} aria-hidden="true">
@@ -3178,17 +3310,22 @@ function InstallmentPanel({ data, setData, sale, biz, currentUserName, can }) {
    doesn't render. `items` is the array from saleItemsSummary(sale, data). */
 function SaleReceiptActions({ biz, sale, items, customer, data }) {
   const [showImageReceipt, setShowImageReceipt] = useState(false);
+  const [showUpgrade, setShowUpgrade] = useState(false);
+  const isPremium = loadLicenseState().isPremium;
   const pdfNodeRef = useRef(null);
   const link = customer && customer.phone ? waLink(customer.phone, buildReceiptMessage(biz, sale, items, customer)) : null;
   return (
     <div className="flex flex-wrap gap-2 mt-2">
       {loadFeatureToggles().enableWhatsAppShare && link && <a href={link} target="_blank" rel="noreferrer" className="inline-block bg-emerald-600 text-white text-xs px-3 py-1.5 rounded-lg no-underline">WhatsApp Receipt</a>}
-      {loadFeatureToggles().enableWhatsAppShare && <button onClick={() => setShowImageReceipt(true)} className="bg-emerald-700 text-white text-xs px-3 py-1.5 rounded-lg">WhatsApp Image Receipt</button>}
+      {loadFeatureToggles().enableWhatsAppShare && (isPremium
+        ? <button onClick={() => setShowImageReceipt(true)} className="bg-emerald-700 text-white text-xs px-3 py-1.5 rounded-lg">WhatsApp Image Receipt</button>
+        : <PremiumLockBadge label="WhatsApp Image Receipt" onClick={() => setShowUpgrade(true)} />)}
       <button onClick={() => printReceiptNode(pdfNodeRef.current, "Receipt " + (sale.invoiceId || ""))} className="bg-slate-800 text-white text-xs px-3 py-1.5 rounded-lg">Print / Save PDF</button>
       <div style={{ position: "fixed", top: 0, left: "-99999px", zIndex: -1 }} aria-hidden="true">
         <ReceiptDesign biz={biz} sale={sale} items={items} customer={customer} data={data} innerRef={pdfNodeRef} />
       </div>
       {showImageReceipt && <WhatsAppReceiptModal biz={biz} sale={sale} items={items} customer={customer} data={data} onClose={() => setShowImageReceipt(false)} />}
+      {showUpgrade && <UpgradeModal featureId="whatsappImageReceipts" onClose={() => setShowUpgrade(false)} />}
     </div>
   );
 }
@@ -3262,6 +3399,8 @@ function SalesTab({ data, setData, role, currentUserName, biz, can }) {
   const [dateTo, setDateTo] = useState("");
   const [statusFilter, setStatusFilter] = useState("all");
   const [sort, setSort] = useState("date:desc");
+  const [showUpgrade, setShowUpgrade] = useState(false);
+  const isPremium = loadLicenseState().isPremium;
 
   const availableItemsBase = useMemo(() => {
     const avail = data.inventory.filter(isStockAvailable);
@@ -3599,7 +3738,12 @@ function SalesTab({ data, setData, role, currentUserName, biz, can }) {
                 <Field label={"Retail Price (" + form.cart.length + " item line" + (form.cart.length === 1 ? "" : "s") + ")"} ur="ریٹیل قیمت"><TextInput disabled value={fmtMoney(cartRetail)} /></Field>
                 <Field label="Discount / Less (overall)" ur="رعایت"><TextInput type="number" value={form.discount} onChange={e => setForm({ ...form, discount: e.target.value })} /></Field>
                 <Field label="Net Sale Price" ur="خالص قیمت"><TextInput disabled value={fmtMoney(netPrice)} className="font-semibold text-emerald-700" /></Field>
-                <Field label="Payment Type" ur="ادائیگی کی قسم"><Select value={form.paymentType} onChange={e => setForm({ ...form, paymentType: e.target.value })} options={loadFeatureToggles().enableInstallments ? ["Full", "Installment"] : ["Full"]} /></Field>
+                <Field label="Payment Type" ur="ادائیگی کی قسم">
+                  <div className="flex items-center gap-2">
+                    <Select value={form.paymentType} onChange={e => setForm({ ...form, paymentType: e.target.value })} options={(loadFeatureToggles().enableInstallments && isPremium) ? ["Full", "Installment"] : ["Full"]} />
+                    {loadFeatureToggles().enableInstallments && !isPremium && <PremiumLockBadge label="Installments" onClick={() => setShowUpgrade(true)} />}
+                  </div>
+                </Field>
                 <Field label="Sale Date" ur="تاریخ"><TextInput type="date" value={form.date} onChange={e => setForm({ ...form, date: e.target.value })} /></Field>
               </div>
               <ImageField label="Receipt Scan (optional)" ur="رسید اسکین" value={form.receiptScan} onChange={v => setForm({ ...form, receiptScan: v })} />
@@ -3695,6 +3839,7 @@ function SalesTab({ data, setData, role, currentUserName, biz, can }) {
           })()}
         </Modal>
       )}
+      {showUpgrade && <UpgradeModal featureId="installments" onClose={() => setShowUpgrade(false)} />}
     </div>
   );
 }
@@ -4354,6 +4499,18 @@ function PartnersTab({ data, setData, can }) {
     if (it) setDrawAmount(String(it.purchasePrice || 0));
   }
 
+  const isPremium = loadLicenseState().isPremium;
+  if (!isPremium) {
+    return (
+      <div>
+        <div className="flex flex-wrap items-center justify-between gap-3 mb-4">
+          <h2 className="text-lg font-semibold text-slate-800"><Bi en="Partner Management & Profit/Loss" ur="پارٹنرشپ اور نفع کا حساب" /></h2>
+        </div>
+        <PremiumGate featureId="multiAccountProfitLoss" isPremium={false}><span /></PremiumGate>
+      </div>
+    );
+  }
+
   return (
     <div>
       <div className="flex flex-wrap items-center justify-between gap-3 mb-4">
@@ -4460,6 +4617,7 @@ function togglePermAction(perms, moduleId, action, checked) {
    under whichever pill is active. */
 const SETTINGS_SECTIONS = [
   { id: "profile", label: "Profile & Branding", ur: "پروفائل", icon: "\u{1F3EC}" },
+  { id: "license", label: "License & Subscription", ur: "لائسنس", icon: "\u{1F511}" },
   { id: "cloud", label: "Cloud Sync", ur: "کلاؤڈ", icon: "\u2601\uFE0F" },
   { id: "users", label: "Users & Access", ur: "رسائی", icon: "\u{1F465}" },
   { id: "customitems", label: "Custom Items", ur: "آئٹمز", icon: "\u{1F3F7}\uFE0F" },
@@ -4472,7 +4630,7 @@ const SETTINGS_SECTIONS = [
    contains or how it's rendered; a section's id, label, icon, and content block are exactly the
    same either way, so this is safe to reorganize freely without touching any settings logic. */
 const SETTINGS_CATEGORIES = [
-  { id: "business", label: "Business", ur: "کاروبار", icon: "\u{1F3E2}", sections: ["profile", "cloud"] },
+  { id: "business", label: "Business", ur: "کاروبار", icon: "\u{1F3E2}", sections: ["profile", "license", "cloud"] },
   { id: "access", label: "Access Control", ur: "رسائی کنٹرول", icon: "\u{1F510}", sections: ["users"] },
   { id: "catalog", label: "Catalog", ur: "کیٹلاگ", icon: "\u{1F3F7}\uFE0F", sections: ["customitems"] },
   { id: "customize", label: "Customization", ur: "حسب ضرورت", icon: "\u{1F3A8}", sections: ["display", "customization"] },
@@ -4985,6 +5143,25 @@ function SettingsTab({ businesses, setBusinesses, currentBiz, setCurrentBizId, u
   const [showReceiptPreview, setShowReceiptPreview] = useState(false);
   const [activeSection, setActiveSection] = useState(null);
 
+  /* ---- License & Subscription (Free vs. Premium) ---- */
+  const [license, setLicense] = useState(() => loadLicenseState());
+  const [licenseKeyInput, setLicenseKeyInput] = useState("");
+  const [licenseError, setLicenseError] = useState("");
+  function submitLicenseKey() {
+    setLicenseError("");
+    const result = activateLicenseKey(licenseKeyInput);
+    if (!result.ok) { setLicenseError(result.error); return; }
+    setLicense(result.state); setLicenseKeyInput("");
+  }
+  function removeLicense() {
+    if (!confirm("Remove this license and go back to the Free plan?")) return;
+    setLicense(deactivateLicense());
+  }
+  /* Admin/Developer Master Control — instant Free <-> Premium flip, no key required. */
+  function toggleAdminOverride(nextIsPremium) {
+    setLicense(setLicenseOverride(nextIsPremium));
+  }
+
   function openAddUser() { setUserForm(blankUserForm()); setEditingUser(null); setShowUserForm(true); }
   function openEditUser(u) { setUserForm({ username: u.username, password: "", name: u.name, email: u.email || "", role: u.role, permissions: u.permissions || defaultPermsForRole(u.role) }); setEditingUser(u.id); setShowUserForm(true); }
   function submitUser() {
@@ -5093,10 +5270,77 @@ function SettingsTab({ businesses, setBusinesses, currentBiz, setCurrentBizId, u
             </div>
           )}
 
+      {activeSection === "license" && (
+      <div className="space-y-4">
+        <div className="bg-white rounded-xl border border-slate-200 p-5">
+          <div className="flex items-center justify-between gap-3 mb-3">
+            <h3 className="text-sm font-semibold text-slate-700">License &amp; Subscription <span className="urdu text-slate-400 text-xs">/ لائسنس اور سبسکرپشن</span></h3>
+            <span className={"text-xs font-semibold px-3 py-1 rounded-full " + (license.isPremium ? "bg-emerald-100 text-emerald-700" : "bg-slate-100 text-slate-600")}>{license.isPremium ? "\u2705 Premium" : "Free Plan"}</span>
+          </div>
+
+          {license.isPremium ? (
+            <div className="text-sm text-slate-600 space-y-2">
+              <div>Premium is active on this device. Every Premium module below is fully unlocked.</div>
+              <div className="text-xs text-slate-400">
+                {license.source === "admin_override" ? "Activated via Admin Override" : <>Activation key: <span className="font-mono">{license.key}</span></>}
+                {license.activatedAt ? " \u00b7 activated " + new Date(license.activatedAt).toLocaleDateString() : ""}
+              </div>
+              <button onClick={removeLicense} className="text-xs px-3 py-1.5 rounded-lg border border-slate-300 text-rose-600 hover:bg-rose-50 mt-1">Remove License / Downgrade to Free</button>
+            </div>
+          ) : (
+            <div>
+              <p className="text-sm text-slate-600 mb-3">You're on the Free plan. Enter an activation key below to unlock every Premium module instantly on this device.</p>
+              <div className="flex flex-col sm:flex-row gap-2 max-w-md">
+                <TextInput placeholder="ZM-XXXX-XXXX-XXXX" value={licenseKeyInput} onChange={e => { setLicenseKeyInput(e.target.value); setLicenseError(""); }} />
+                <button onClick={submitLicenseKey} className="bg-[var(--accent-600)] hover:bg-[var(--accent-700)] text-white text-sm font-medium px-4 py-2 rounded-lg whitespace-nowrap">Activate</button>
+              </div>
+              {licenseError && <div className="text-xs text-rose-500 mt-2">{licenseError}</div>}
+              <p className="text-[11px] text-slate-400 mt-3">Demo/testing key: <span className="font-mono">ZM-PREM-2026-01LR</span></p>
+            </div>
+          )}
+        </div>
+
+        {currentUser.role === "Admin" && (
+          <div className="bg-white rounded-xl border border-amber-200 p-5">
+            <h3 className="text-sm font-semibold text-slate-700 mb-1">Developer / Admin Master Control <span className="urdu text-slate-400 text-xs">/ ایڈمن کنٹرول</span></h3>
+            <p className="text-xs text-slate-500 mb-3">Admin-only. Instantly flips this account between Free and Premium for testing or direct client management — no activation key needed. Overrides (and is overridden by) whatever the license key above set.</p>
+            <ToggleSwitch label={license.isPremium ? "Premium (forced on)" : "Force Premium On"} ur="پریمیم زبردستی آن" checked={license.isPremium} onChange={v => toggleAdminOverride(v)} />
+            <p className="text-[11px] text-amber-600 mt-2">This is a local, device-only override for testing/admin use — it bypasses key validation entirely and is not a substitute for real license enforcement in production.</p>
+          </div>
+        )}
+
+        <div className="bg-white rounded-xl border border-slate-200 p-5">
+          <h3 className="text-sm font-semibold text-slate-700 mb-3">Free vs. Premium <span className="urdu text-slate-400 text-xs">/ فری بمقابلہ پریمیم</span></h3>
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+            <div>
+              <div className="text-xs font-semibold uppercase tracking-wide text-slate-400 mb-2">Free</div>
+              <ul className="text-sm text-slate-600 space-y-1.5">
+                <li className="flex gap-2"><span className="text-emerald-500">&#10003;</span>Basic POS &amp; Sales (Full payment)</li>
+                <li className="flex gap-2"><span className="text-emerald-500">&#10003;</span>Inventory up to {FREE_PLAN_LIMITS.maxInventoryItems} items</li>
+                <li className="flex gap-2"><span className="text-emerald-500">&#10003;</span>Basic cash &amp; bank accounts</li>
+                <li className="flex gap-2"><span className="text-emerald-500">&#10003;</span>Text WhatsApp receipts &amp; CSV exports</li>
+              </ul>
+            </div>
+            <div>
+              <div className="text-xs font-semibold uppercase tracking-wide text-amber-500 mb-2">Premium</div>
+              <ul className="text-sm text-slate-600 space-y-1.5">
+                {Object.keys(PREMIUM_FEATURES).filter(k => k !== "inventoryLimit").map(k => (
+                  <li key={k} className="flex gap-2"><span className="text-amber-500">&#128274;</span>{PREMIUM_FEATURES[k].label}</li>
+                ))}
+                <li className="flex gap-2"><span className="text-amber-500">&#128274;</span>Unlimited inventory</li>
+              </ul>
+            </div>
+          </div>
+        </div>
+      </div>
+      )}
+
       {activeSection === "cloud" && (
       <div className="bg-white rounded-xl border border-slate-200 p-5 mb-6">
         <h3 className="text-sm font-semibold text-slate-700 mb-3">Cloud Sync (Firebase) / کلاؤڈ سنک</h3>
-        {!CLOUD_ENABLED ? (
+        {!license.isPremium ? (
+          <PremiumGate featureId="cloudSync" isPremium={false}><span /></PremiumGate>
+        ) : !CLOUD_ENABLED ? (
           <p className="text-xs text-slate-500">
             Not configured or currently disabled. This app is running 100% locally on this device/browser — nothing
             leaves it. Add your own Firebase project's keys below and turn Cloud Sync on to enable cross-device backup.
@@ -5115,7 +5359,7 @@ function SettingsTab({ businesses, setBusinesses, currentBiz, setCurrentBizId, u
             {!cloudUser && <div>Sign in from the login screen ("Sign in with Cloud Account") to start syncing this business's data.</div>}
           </div>
         )}
-        <FirebaseConfigPanel />
+        {license.isPremium && <FirebaseConfigPanel />}
       </div>
       )}
 
@@ -5773,6 +6017,7 @@ function ExportTab({ data, currentBiz, setData }) {
       )}
 
       {activeSection === "reports" && (
+        <PremiumGate featureId="advancedReports" isPremium={loadLicenseState().isPremium}>
         <div className="bg-white rounded-xl border border-slate-200 p-5">
           <h3 className="text-sm font-semibold text-slate-700 mb-1">Reports (PDF & Excel) <span className="urdu text-slate-400 text-xs">/ رپورٹس</span></h3>
           <p className="text-xs text-slate-500 mb-3">Export any report as a formatted PDF or an Excel sheet.</p>
@@ -5800,6 +6045,7 @@ function ExportTab({ data, currentBiz, setData }) {
             ))}
           </div>
         </div>
+        </PremiumGate>
       )}
 
       {activeSection === "backup" && (
