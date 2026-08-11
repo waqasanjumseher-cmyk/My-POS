@@ -459,22 +459,18 @@ function customLoadNavPrefs() {
   return visibility;
 }
 
-/* Small, reusable "quick switcher" for the same isolated business type used throughout Advanced
-   Customization (CUSTOM_BUSINESS_TYPE_KEY) — reads/writes the identical LocalStorage key, so
-   changing it here or in Settings keeps both in sync automatically. Placed on the Inventory
-   screen since that's where the business type most directly changes what you see (categories +
-   fields), per your request to surface it outside Settings. Purely a convenience — Settings >
-   Advanced Customization still works exactly the same and shows the same value. */
+/* Read-only Business Type badge shown on the Inventory screen (categories + fields below depend
+   on it). Business Type is assigned exclusively by the Master Developer from the private
+   zahidy-developer-dashboard.html tool and synced down via the listener in App() — there is no
+   picker here or anywhere else in this file a shop owner/staff member can use to change it. */
 function BusinessTypeQuickSwitcher() {
-  const [businessType, setBusinessType] = useState(() => loadJSON(CUSTOM_BUSINESS_TYPE_KEY, "mobile_shop"));
-  function change(type) { setBusinessType(type); saveJSON(CUSTOM_BUSINESS_TYPE_KEY, type); window.location.reload(); }
+  const businessType = loadJSON(CUSTOM_BUSINESS_TYPE_KEY, "mobile_shop");
+  const label = (CUSTOM_BUSINESS_TYPES[businessType] || CUSTOM_BUSINESS_TYPES.mobile_shop).label;
   return (
     <div className="flex items-center gap-2 bg-slate-50 border border-slate-200 rounded-lg px-3 py-2 mb-4 text-sm">
       <span className="text-slate-500 whitespace-nowrap">{"\u{1F3E2}"} Business Type:</span>
-      <select value={businessType} onChange={e => change(e.target.value)} className="border border-slate-300 rounded-lg px-2 py-1 bg-white text-sm flex-shrink-0">
-        {Object.values(CUSTOM_BUSINESS_TYPES).map(o => <option key={o.id} value={o.id}>{o.label}</option>)}
-      </select>
-      <span className="text-xs text-slate-400">Changes categories &amp; fields below. Also editable in Business Settings &gt; Advanced Customization.</span>
+      <span className="font-medium text-slate-700">{label}</span>
+      <span className="flex items-center gap-1 text-xs text-slate-400 ml-1">{"\u{1F512}"} Locked — set by your service provider</span>
     </div>
   );
 }
@@ -518,6 +514,9 @@ function defaultFeatureToggles() {
     enableGoogleLogin: true, enableForgotPassword: true, enableSelfRegistration: true, enableAdminApproval: true,
     // Receipt / module options
     enableWhatsAppShare: true, enablePaymentReminders: true, enableInstallments: true,
+    // Sales screen options — both default OFF so an existing shop's Sales flow doesn't change
+    // until they turn one on deliberately.
+    enableAutoAddToCart: false, enableCategoryVisualGrid: false,
   };
 }
 function loadFeatureToggles() { return { ...defaultFeatureToggles(), ...loadJSON(FEATURE_TOGGLES_KEY, {}) }; }
@@ -529,7 +528,7 @@ function recordAuditLog(actionType, details, username) {
 }
 
 /* ============================ LICENSING & SUBSCRIPTION (Free vs. Premium) ============================
-   Zahidy Mobiles ships as one build with every screen present; a locally-stored `isPremium` flag
+   Anjum Webs POS ships as one build with every screen present; a locally-stored `isPremium` flag
    decides whether Premium-only modules actually run or fall back to a locked "Upgrade" prompt.
    There is no license server here (this is a single portable HTML file with no backend) — keys
    are validated locally with a deterministic checksum, the same pattern a lot of offline desktop
@@ -537,7 +536,15 @@ function recordAuditLog(actionType, details, username) {
    licensing API without touching anything else, since every gate below only reads `isPremium`.
 
    Key format: ZM-XXXX-XXXX-CCCC, where CCCC is a checksum of the two preceding 4-character groups.
-   Demo/testing key (always valid): ZM-PREM-2026-01LR
+   For keys generated from the Developer Panel, the first group also encodes the plan's validity —
+   "P" + a 3-character base36 day-count (or "LIF" for Lifetime) — decoded by decodeLicenseKey() below
+   so a 30-day/1-year/Lifetime key is fully self-describing and needs no lookup table to validate.
+   Any older/manually-typed key whose first group doesn't parse that way (like the demo key below)
+   is treated as a legacy Lifetime Premium key, so nothing issued before this scheme breaks.
+   NOTE: the demo/testing key that used to be shown in-app (ZM-PREM-2026-01LR) has been revoked —
+   see REVOKED_KEYS near decodeLicenseKey() below — because showing it to every user, Free
+   included, let anyone self-activate permanent Premium. Don't reintroduce a publicly-displayed
+   always-valid key; issue real per-shop keys from the Developer Dashboard instead.
    ---------------------------------------------------------------------------------------------- */
 const LICENSE_KEY_STORAGE = "customSettings_license";
 // Free plan limits — customize freely; Premium has no cap.
@@ -552,12 +559,34 @@ const PREMIUM_FEATURES = {
   multiAccountProfitLoss: { label: "Multi-Account Profit/Loss", ur: "ملٹی اکاؤنٹ نفع نقصان", note: "Partner management with profit/loss allocation tracked across multiple accounts." },
   cloudSync: { label: "Cloud Sync", ur: "کلاؤڈ سنک", note: "Live backup and sync of your business data across every device." },
   inventoryLimit: { label: "Unlimited Inventory", ur: "لامحدود انوینٹری", note: "The Free plan is capped at " + FREE_PLAN_LIMITS.maxInventoryItems + " inventory items — upgrade for unlimited stock." },
+  backupRestore: { label: "Backup & Restore", ur: "بیک اپ اور بحالی", note: "Export a full backup of your business data and restore it back — JSON or multi-sheet Excel, including one-click full restore." },
+  importMerge: { label: "Import & Merge", ur: "درآمد اور ضم", note: "Bulk-import or update Inventory, Customers, Dealers, Accounts, Sales and more from CSV/Excel/JSON, matched and merged automatically." },
+  businessSettings: { label: "Business Settings", ur: "کاروبار کی ترتیبات", note: "POS & Sales Preferences, Users & Access, Custom Items, Customize Display, Advanced Customization, and System settings are Premium. Profile & Branding stays free." },
 };
-function defaultLicenseState() { return { isPremium: false, key: "", activatedAt: null, source: null }; }
+function defaultLicenseState() { return { isPremium: false, key: "", activatedAt: null, expiresAt: null, source: null }; }
 /* Read fresh in every gated component's render (same convention as loadFeatureToggles() elsewhere
    in this file) so activating/removing a license in Settings takes effect the moment that screen
-   or tab re-renders — no extra plumbing or context provider needed. */
-function loadLicenseState() { return { ...defaultLicenseState(), ...loadJSON(LICENSE_KEY_STORAGE, {}) }; }
+   or tab re-renders — no extra plumbing or context provider needed. Also self-heals expiry: any
+   time this is read after a timed key's expiresAt has passed, it quietly downgrades to Free and
+   remembers what expired (lastKey/lastExpiresAt) so the License screen can explain why. */
+function loadLicenseState() {
+  const state = { ...defaultLicenseState(), ...loadJSON(LICENSE_KEY_STORAGE, {}) };
+  // Retroactively downgrades any device that already activated Premium using a key that's since
+  // been revoked (see REVOKED_KEYS above) — e.g. the old publicly-shown demo key. Without this,
+  // a device that activated before the key was revoked would keep its cached Premium forever,
+  // since REVOKED_KEYS is only ever consulted at activation time otherwise.
+  if (state.isPremium && state.source === "key" && REVOKED_KEYS.includes(state.key)) {
+    const revoked = { ...defaultLicenseState(), source: "expired", lastKey: state.key, lastExpiresAt: state.expiresAt || null };
+    saveJSON(LICENSE_KEY_STORAGE, revoked);
+    return revoked;
+  }
+  if (state.isPremium && state.expiresAt && new Date(state.expiresAt).getTime() <= Date.now()) {
+    const expired = { ...defaultLicenseState(), source: "expired", lastKey: state.key, lastExpiresAt: state.expiresAt };
+    saveJSON(LICENSE_KEY_STORAGE, expired);
+    return expired;
+  }
+  return state;
+}
 function saveLicenseState(state) { saveJSON(LICENSE_KEY_STORAGE, state); }
 function normalizeLicenseKeyInput(raw) { return (raw || "").trim().toUpperCase().replace(/\s+/g, ""); }
 function licenseChecksumSegment(body) {
@@ -565,33 +594,177 @@ function licenseChecksumSegment(body) {
   for (let i = 0; i < body.length; i++) sum += body.charCodeAt(i) * (i + 1);
   return sum.toString(36).toUpperCase().padStart(4, "0").slice(-4);
 }
-function isValidLicenseKey(raw) {
-  const key = normalizeLicenseKeyInput(raw);
-  const m = /^ZM-([A-Z0-9]{4})-([A-Z0-9]{4})-([A-Z0-9]{4})$/.exec(key);
-  if (!m) return false;
-  const [, g1, g2, cs] = m;
-  return licenseChecksumSegment(g1 + g2) === cs;
+/* Returns null for Lifetime, a number of days for a timed key, or undefined if `code` doesn't
+   parse as either — the undefined case is what lets old/legacy-shaped keys fall through safely.
+   Key GENERATION (encodeDurationCode + the key-builder that used it) has been moved to the
+   separate zahidy-developer-dashboard.html — this file only ever decodes/validates a key someone
+   typed in, it can't mint new ones. */
+function decodeDurationCode(code) {
+  if (code === "LIF") return null;
+  if (/^[0-9A-Z]{3}$/.test(code)) return parseInt(code, 36);
+  return undefined;
 }
-function activateLicenseKey(raw) {
+/* Validates the checksum and decodes plan/validity in one pass. Returns null for anything that
+   fails the checksum; otherwise { key, durationDays } where durationDays is null for Lifetime.
+   REVOKED_KEYS: keys that pass the checksum algorithm but must never activate anymore — currently
+   just the old publicly-displayed "demo/testing" key (ZM-PREM-2026-01LR), which used to be shown
+   directly in the Settings -> License & Subscription screen. Since it was shown in-app to every
+   user (Free included), anyone could type it in and get real, permanent Premium — so it's revoked
+   here explicitly rather than merely removed from the UI text, which would leave it silently
+   working for anyone who already knows it. Add any other key that needs retroactive revocation
+   to this list the same way. */
+const REVOKED_KEYS = ["ZM-PREM-2026-01LR"];
+function decodeLicenseKey(raw) {
   const key = normalizeLicenseKeyInput(raw);
-  if (!isValidLicenseKey(key)) return { ok: false, error: "That license key isn't valid. Double-check it and try again." };
-  const state = { isPremium: true, key, activatedAt: new Date().toISOString(), source: "key" };
+  if (REVOKED_KEYS.includes(key)) return null;
+  const m = /^ZM-([A-Z0-9]{4})-([A-Z0-9]{4})-([A-Z0-9]{4})$/.exec(key);
+  if (!m) return null;
+  const [, g1, g2, cs] = m;
+  if (licenseChecksumSegment(g1 + g2) !== cs) return null;
+  let durationDays = null; // default: treat as Lifetime unless g1 decodes to a real duration
+  if (g1[0] === "P") {
+    const decoded = decodeDurationCode(g1.slice(1));
+    if (decoded !== undefined) durationDays = decoded;
+  }
+  return { key, durationDays };
+}
+function isValidLicenseKey(raw) { return !!decodeLicenseKey(raw); }
+function activateLicenseKey(raw) {
+  const decoded = decodeLicenseKey(raw);
+  if (!decoded) return { ok: false, error: "That license key isn't valid. Double-check it and try again." };
+  const now = new Date();
+  const expiresAt = decoded.durationDays == null ? null : new Date(now.getTime() + decoded.durationDays * 86400000).toISOString();
+  const state = { isPremium: true, key: decoded.key, activatedAt: now.toISOString(), expiresAt, source: "key" };
   saveLicenseState(state);
   return { ok: true, state };
 }
 function deactivateLicense() { const state = defaultLicenseState(); saveLicenseState(state); return state; }
-/* Admin/Developer Master Control — lets an Admin flip any account between Free and Premium
-   instantly from the app UI, bypassing key entry entirely (for QA/testing or direct client
-   management). Writes to the exact same LICENSE_KEY_STORAGE record as a real key activation, so
-   every existing gate (which only ever reads isPremium) keeps working unchanged; `source` just
-   remembers how the current state got there so Settings can show "Admin Override" vs a real key. */
-function setLicenseOverride(nextIsPremium) {
-  const current = loadLicenseState();
-  const state = nextIsPremium
-    ? { isPremium: true, key: current.source === "key" ? current.key : "ADMIN-OVERRIDE", activatedAt: new Date().toISOString(), source: "admin_override" }
-    : { isPremium: false, key: "", activatedAt: new Date().toISOString(), source: "admin_override" };
-  saveLicenseState(state);
-  return state;
+
+/* ============================ DEVELOPER MODE — MOVED OUT OF THIS FILE ============================
+   Key generation, the cross-shop "Activated Shops" registry, and the ability to flip any shop
+   between Free/Premium now live ONLY in the separate zahidy-developer-dashboard.html file, which
+   is never shipped to a shop/client — it's a standalone tool for you (the developer) to keep on
+   your own machine. This client file only knows how to READ and VALIDATE a key someone typed in
+   (below) and report its OWN activation status to the shared registry so your dashboard can see
+   it — there is no code path left in this file, reachable by any password, tap sequence, or
+   console command, that can generate a key or grant Premium to any shop. ---------------------- */
+/* ---- Cloud License Registry (Firestore, best-effort, write-only from this file) ----
+   Anjum Webs POS ships with a shared Firebase project baked in by default (see FIREBASE_BUILTIN_
+   CONFIG near the top of this file). This client only ever WRITES its own activation status here
+   (cloudPushActivation) so the separate developer dashboard can see it — it never reads this
+   collection back. Everything is a no-op when Cloud Sync isn't configured/enabled (CLOUD_ENABLED
+   false) or a write fails, exactly like cloudPushData/cloudPushUsers elsewhere in this file —
+   license activation/validation always work fully offline off the key itself. */
+function licenseActivationsCollection() { return fbDb.collection("system").doc("license_registry").collection("activations"); }
+/* The developer dashboard's actual source of truth for a shop's login credentials, plan, and
+   Business Type lives in this "clients" collection (NOT "activations" — that collection only
+   ever receives a mirrored, credential-free subset of the same fields, keyed the same way, for
+   the dashboard's own "Unregistered Activations" bookkeeping). Doc id is a developer-assigned
+   bizId, not the username, so a shop is always looked up here by its "username" field. */
+function clientsCollection() { return fbDb.collection("system").doc("license_registry").collection("clients"); }
+function cloudPushActivation(bizId, bizName, state) {
+  if (!CLOUD_ENABLED || !fbDb || !bizId) return;
+  licenseActivationsCollection().doc(bizId).set({
+    bizId, bizName: bizName || "", key: state.key || "", isPremium: !!state.isPremium, source: state.source || null,
+    activatedAt: state.activatedAt || null, expiresAt: state.expiresAt || null,
+    updatedAt: firebase.firestore.FieldValue.serverTimestamp(),
+  }, { merge: true }).catch(err => console.warn("License activation push failed:", err.code));
+  if (state.source === "key" && state.key) {
+    fbDb.collection("system").doc("license_registry").collection("keys").doc(state.key).set({
+      redeemed: true, redeemedBy: bizId, redeemedByName: bizName || "", redeemedAt: firebase.firestore.FieldValue.serverTimestamp(),
+    }, { merge: true }).catch(() => {});
+  }
+}
+
+/* ============================ DEVELOPER-ASSIGNED CONFIG (Business Type registration) ============
+   Registers this shop (merge-only, so it never clobbers businessType/isPremium/expiresAt the
+   developer has already set) so a brand-new shop shows up in the developer dashboard's "Activated
+   Shops" list even before ever touching a license key. The actual read-back — applying a
+   developer-assigned businessType, and mirroring remote Grant/Revoke — happens in the existing
+   license-mirror listener in App() (search for "License mirror listener"), extended below to also
+   handle businessType instead of duplicating a second listener on the same document. */
+function cloudRegisterShop(bizId, bizName) {
+  if (!CLOUD_ENABLED || !fbDb || !bizId) return;
+  licenseActivationsCollection().doc(bizId).set({
+    bizId, bizName: bizName || "", lastSeenAt: firebase.firestore.FieldValue.serverTimestamp(),
+  }, { merge: true }).catch(err => console.warn("Shop registration push failed:", err.code));
+}
+
+/* ============================ SHOP-LEVEL CLOUD AUTHENTICATION (Master Login) ============
+   Replaces any notion of a shop just "existing" locally the moment someone opens this file. A
+   shop account (username + password) is created for this shop by the Master Developer, in the
+   "clients" collection under system/license_registry — the record that holds credentials, plan,
+   Business Type, and the "blocked" (suspended) flag. Looked up here by its "username" field
+   (the doc id is a developer-assigned bizId, not the username itself). A credential-free subset
+   of the same record is mirrored into the separate "activations" collection (see
+   cloudRegisterShop / the license-mirror listener below) purely so the dashboard's "Unregistered
+   Activations" list and the real-time Business Type/Premium/suspend push work — that mirrored
+   copy is never used to check a password. The password is only ever compared as a SHA-256 hash,
+   both here and in the developer dashboard that sets it — the plaintext is never written anywhere.
+   Per the shop owner's choice: the FIRST login on a given device/browser must be online (there is
+   nothing to check a password against otherwise). Every login after that works fully offline too
+   — the verified account is cached locally (CLOUD_SHOP_ACCOUNT_KEY) and reused, exactly like the
+   rest of this app, while still re-verifying silently against the cloud whenever it's reachable
+   (see the license-mirror listener in App(), which now also watches for "blocked" flipping to
+   true and signs the device out if it sees that). */
+const CLOUD_SHOP_ACCOUNT_KEY = "erp_cloudShopAccount";
+function loadCloudShopAccount() { return loadJSON(CLOUD_SHOP_ACCOUNT_KEY, null); }
+function saveCloudShopAccount(acct) { saveJSON(CLOUD_SHOP_ACCOUNT_KEY, acct); }
+function clearCloudShopAccount() { try { localStorage.removeItem(CLOUD_SHOP_ACCOUNT_KEY); } catch (e) {} }
+function normalizeShopUsername(u) { return (u || "").trim().toLowerCase().replace(/[^a-z0-9_.-]/g, ""); }
+async function sha256Hex(text) {
+  const bytes = new TextEncoder().encode(text || "");
+  const digest = await crypto.subtle.digest("SHA-256", bytes);
+  return Array.from(new Uint8Array(digest)).map(b => b.toString(16).padStart(2, "0")).join("");
+}
+/* Wherever this file talks to the shared Firestore registry about "this shop" (license push,
+   Business Type sync, etc.), it should use the DEVELOPER-ASSIGNED id (the normalized username)
+   once one exists, so every write lands on the exact same document the developer dashboard's
+   Activated Shops / Shop Accounts list shows. Falls back to the plain local biz id only for the
+   narrow case of Cloud Sync being used before Master Login exists at all (shouldn't normally
+   happen under this architecture, but avoids a hard crash if it does). */
+function cloudShopId(currentBiz) {
+  const acct = loadCloudShopAccount();
+  return (acct && acct.bizId) || (currentBiz && currentBiz.id) || null;
+}
+async function attemptShopLogin(username, password, isOnline) {
+  const uname = normalizeShopUsername(username);
+  if (!uname || !password) return { ok: false, error: "Enter your shop username and password." };
+  const cached = loadCloudShopAccount();
+  const NOT_FOUND_ERROR = "No shop account found for this username. Please contact your service provider.";
+  if (CLOUD_ENABLED && fbDb && isOnline) {
+    try {
+      const snap = await clientsCollection().where("username", "==", uname).limit(1).get();
+      if (snap.empty) return { ok: false, error: NOT_FOUND_ERROR };
+      const doc = snap.docs[0];
+      const data = doc.data();
+      if (!data.passwordHash) return { ok: false, error: NOT_FOUND_ERROR };
+      if (data.blocked) return { ok: false, error: NOT_FOUND_ERROR };
+      const hash = await sha256Hex(password);
+      if (hash !== data.passwordHash) return { ok: false, error: "Incorrect username or password." };
+      const isPremium = !!(data.tier && data.tier !== "free" && !(data.expiresAt && new Date(data.expiresAt).getTime() <= Date.now()));
+      const acct = {
+        bizId: doc.id, username: uname, passwordHash: hash, shopName: data.shopName || "",
+        businessType: data.businessType || "mobile_shop", businessTypeLocked: data.businessTypeLocked !== false,
+        blocked: !!data.blocked, isPremium, key: data.licenseKey || "",
+        activatedAt: isPremium ? (data.activatedAt || null) : null, expiresAt: data.expiresAt || null,
+        source: isPremium ? "developer_remote" : null, featureOverrides: data.featureOverrides || {},
+        lastVerifiedAt: new Date().toISOString(),
+      };
+      return { ok: true, data: acct };
+    } catch (err) {
+      console.warn("Shop login (online) failed, falling back to cached credentials if any:", err.code);
+      // falls through to the offline check below — e.g. a flaky connection reported navigator.onLine
+      // true but the request itself still failed
+    }
+  }
+  // ---- Offline path: only ever succeeds against a PREVIOUSLY verified cache on this device. ----
+  if (!cached) return { ok: false, error: "Internet connection required to activate this shop for the first time. Please connect and try again." };
+  if (cached.username !== uname) return { ok: false, error: "Incorrect username or password." };
+  const hash = await sha256Hex(password);
+  if (hash !== cached.passwordHash) return { ok: false, error: "Incorrect username or password." };
+  if (cached.blocked) return { ok: false, error: NOT_FOUND_ERROR };
+  return { ok: true, data: cached };
 }
 
 function defaultUiPrefs() {
@@ -1182,7 +1355,13 @@ function can(user, moduleId, action) {
 function loadUsers() {
   let users = loadJSON(USERS_KEY, null);
   if (!users || users.length === 0) {
-    users = [{ id: uid("user"), username: "admin", password: "admin123", name: "Administrator", email: "", role: "Admin", permissions: defaultPermsForRole("Admin"), status: "Active" }];
+    // No known static default (no "admin"/"admin123") — a random password that's never shown
+    // anywhere means this account can't actually be signed into until the shop owner sets their
+    // own credentials in SetupWizard step 3 (Authentication), or an Admin resets it later from
+    // Manage Users. Login stays fully blocked either way until that happens, since a password
+    // nobody knows is functionally the same as no working credential existing yet.
+    const randomPass = Math.random().toString(36).slice(2, 10) + Math.random().toString(36).slice(2, 6).toUpperCase();
+    users = [{ id: uid("user"), username: "admin", password: randomPass, name: "Administrator", email: "", role: "Admin", permissions: defaultPermsForRole("Admin"), status: "Active" }];
     saveJSON(USERS_KEY, users);
   }
   // migrate any users saved before the (granular) permission matrix existed, the email field
@@ -2150,7 +2329,7 @@ function UpgradeModal({ featureId, onClose }) {
     <Modal title={"\u{1F512} " + f.label + " is a Premium feature"} ur={f.ur} onClose={onClose}>
       <p className="text-sm text-slate-600 mb-3">{f.note}</p>
       <div className="bg-amber-50 border border-amber-200 rounded-lg px-3 py-2.5 text-xs text-amber-800 mb-4">
-        Upgrade to Zahidy Mobiles Premium to unlock this and every other Premium module — Installments,
+        Upgrade to Anjum Webs POS Premium to unlock this and every other Premium module — Installments,
         Advanced PDF/Excel Reports, WhatsApp Image Receipts, Multi-Account Profit/Loss, and Cloud Sync.
       </div>
       <p className="text-xs text-slate-500 mb-4">Have a license key? Go to <b>Settings &rarr; License &amp; Subscription</b> to activate it.</p>
@@ -3331,7 +3510,7 @@ function SaleReceiptActions({ biz, sale, items, customer, data }) {
 }
 /* ============================ SALES TAB ============================ */
 function blankSaleForm(data) {
-  return { cart: [], customerId: "", manualReceiptNumber: "", discount: "0", paymentType: "Full", accountId: (data.accounts[0] && data.accounts[0].id) || "", bankRef: "", date: todayISO(), downPayment: "", monthlyInstallment: "", durationMonths: "6", firstDueDate: addMonthsISO(todayISO(), 1), frequency: "Monthly", receiptScan: "" };
+  return { cart: [], customerId: "", manualReceiptNumber: "", discount: "0", paymentType: "Full", accountId: (data.accounts[0] && data.accounts[0].id) || "", bankRef: "", date: todayISO(), downPayment: "", monthlyInstallment: "", durationMonths: "6", firstDueDate: addMonthsISO(todayISO(), 1), frequency: "Monthly", receiptScan: "", tableInfo: "" };
 }
 function blankCustomer() { return { name: "", phone: "", cnic: "", address: "", guarantorName: "", guarantorPhone: "", photo: "", cnicFront: "", cnicBack: "", guarantorProof: "" }; }
 function generatePlan(installmentAmount, durationCount, firstDueDate, frequency) {
@@ -3401,6 +3580,8 @@ function SalesTab({ data, setData, role, currentUserName, biz, can }) {
   const [sort, setSort] = useState("date:desc");
   const [showUpgrade, setShowUpgrade] = useState(false);
   const isPremium = loadLicenseState().isPremium;
+  const featureToggles = loadFeatureToggles();
+  const [pickCategoryFilter, setPickCategoryFilter] = useState("");
 
   const availableItemsBase = useMemo(() => {
     const avail = data.inventory.filter(isStockAvailable);
@@ -3419,6 +3600,19 @@ function SalesTab({ data, setData, role, currentUserName, biz, can }) {
   // accounts for what's already sitting in the cart instead of hiding the row entirely.
   const cartClaimedIds = useMemo(() => new Set(form.cart.filter(l => !l.bulk).flatMap(l => l.itemIds || [])), [form.cart]);
   const availableItems = useMemo(() => availableItemsBase.filter(i => !cartClaimedIds.has(i.id)), [availableItemsBase, cartClaimedIds]);
+  // Category Visual Grid (Settings -> Advanced Customization -> Feature Toggles -> "Category
+  // Visual Grid"): purely narrows what the item picker below shows — everything else (stock
+  // math, cart, editing) works off availableItems as it always did. "" means no category chosen
+  // yet / show everything, same as the grid being off.
+  const pickerCategoryOptions = useMemo(() => {
+    const counts = {};
+    availableItems.forEach(i => { counts[i.category] = (counts[i.category] || 0) + 1; });
+    return allCategories(data).map(c => ({ name: c, count: counts[c] || 0 })).filter(c => c.count > 0);
+  }, [availableItems, data]);
+  const availableItemsForPicker = useMemo(() => {
+    if (!featureToggles.enableCategoryVisualGrid || !pickCategoryFilter) return availableItems;
+    return availableItems.filter(i => i.category === pickCategoryFilter);
+  }, [availableItems, featureToggles.enableCategoryVisualGrid, pickCategoryFilter]);
   // How much of each bulk item THIS cart already holds — subtracted from that row's live quantity
   // so pickPoolCount never lets you oversell what's actually left.
   const cartClaimedQtyByItemId = useMemo(() => {
@@ -3470,6 +3664,40 @@ function SalesTab({ data, setData, role, currentUserName, biz, can }) {
     }
     setPickItemId(""); setPickQuantity("1");
   }
+  /* Auto-Add Item on Selection (Settings -> Advanced Customization -> Feature Toggles): fires
+     straight from the picker's onSelect instead of waiting for the "+ Add to Cart" button click.
+     Looks the item up directly from the id the dropdown just handed back rather than relying on
+     `pickItem`/`pickPoolCount` above, since those are still one render behind at this point.
+     Serialized items (IMEI/Serial) add at qty 1 and reset the search, same as the button flow.
+     Bulk items add/increment by 1 unit per selection and also reset the search — selecting the
+     same item again from the (still-visible) list adds one more, so the flow stays a single
+     click/tap per unit with no separate "confirm quantity" step. */
+  function autoAddItemById(id) {
+    const item = data.inventory.find(i => i.id === id);
+    if (!item) return;
+    const cfg = categoryConfig(item.category);
+    const serialized = !!(cfg && cfg.idRequired);
+    const unitPrice = Number(item.retailPrice) || 0;
+    if (serialized) {
+      const line = { id: uid("line"), itemId: item.id, itemIds: [item.id], quantity: 1, unitPrice, lineRetail: unitPrice, bulk: false };
+      setForm({ ...form, cart: [...form.cart, line] });
+      setPickItemId(""); setPickQuantity("1");
+      return;
+    }
+    const stock = Number(item.quantity) || 0;
+    const poolCount = Math.max(0, stock + (originalBulkQtyByItemId[item.id] || 0) - (cartClaimedQtyByItemId[item.id] || 0));
+    if (poolCount <= 0) { alert("No more stock available to add for this item"); setPickItemId(""); setPickQuantity("1"); return; }
+    const existingLine = form.cart.find(l => l.bulk && l.itemId === item.id);
+    if (existingLine) {
+      const newQty = existingLine.quantity + 1;
+      const updated = { ...existingLine, quantity: newQty, lineRetail: unitPrice * newQty };
+      setForm({ ...form, cart: form.cart.map(l => l.id === existingLine.id ? updated : l) });
+    } else {
+      const line = { id: uid("line"), itemId: item.id, itemIds: [item.id], quantity: 1, unitPrice, lineRetail: unitPrice, bulk: true };
+      setForm({ ...form, cart: [...form.cart, line] });
+    }
+    setPickItemId(""); setPickQuantity("1");
+  }
   function removeCartLine(lineId) {
     setForm({ ...form, cart: form.cart.filter(l => l.id !== lineId) });
   }
@@ -3497,7 +3725,7 @@ function SalesTab({ data, setData, role, currentUserName, biz, can }) {
       cart, customerId: s.customerId, manualReceiptNumber: s.manualReceiptNumber || "", discount: String(s.discount || 0),
       paymentType: s.paymentType, accountId: s.accountId || (data.accounts[0] && data.accounts[0].id) || "", bankRef: s.bankRef || "", date: s.date || todayISO(),
       downPayment: String(s.downPayment || 0), monthlyInstallment: String(s.monthlyInstallment || 0), durationMonths: String(s.durationMonths || 6),
-      firstDueDate: s.firstDueDate || addMonthsISO(todayISO(), 1), frequency: s.frequency || "Monthly", receiptScan: s.receiptScan || "",
+      firstDueDate: s.firstDueDate || addMonthsISO(todayISO(), 1), frequency: s.frequency || "Monthly", receiptScan: s.receiptScan || "", tableInfo: s.tableInfo || "",
     });
     setPickItemId(""); setPickQuantity("1");
     setShowForm(true);
@@ -3523,7 +3751,7 @@ function SalesTab({ data, setData, role, currentUserName, biz, can }) {
         itemId: saleItemIds[0] || "", itemIds: saleItemIds, quantity: saleItemIds.length, customerId: form.customerId,
         customerName: customer.name, customerPhone: customer.phone, retailPrice: retail, discount: Number(form.discount) || 0, salePrice: netPrice,
         paymentType: form.paymentType, paidAmount, accountId: form.accountId, bankRef: form.bankRef, date: form.date, receiptScan: form.receiptScan,
-        downPayment, monthlyInstallment, durationMonths, firstDueDate, frequency: form.frequency, installmentPlan: plan,
+        downPayment, monthlyInstallment, durationMonths, firstDueDate, frequency: form.frequency, installmentPlan: plan, tableInfo: form.tableInfo,
       };
       // Restore whatever stock effect the ORIGINAL sale had, then apply the NEW cart's effect —
       // correct for both quantity-based bulk rows and status-based serialized/legacy rows.
@@ -3538,7 +3766,7 @@ function SalesTab({ data, setData, role, currentUserName, biz, can }) {
         itemId: saleItemIds[0] || "", itemIds: saleItemIds, quantity: saleItemIds.length, customerId: form.customerId,
         customerName: customer.name, customerPhone: customer.phone, retailPrice: retail, discount: Number(form.discount) || 0, salePrice: netPrice,
         paymentType: form.paymentType, paidAmount, accountId: form.accountId, bankRef: form.bankRef, date: form.date, receiptScan: form.receiptScan,
-        downPayment, monthlyInstallment, durationMonths, firstDueDate, frequency: form.frequency, installmentPlan: plan, installmentPayments: [], soldBy: currentUserName,
+        downPayment, monthlyInstallment, durationMonths, firstDueDate, frequency: form.frequency, installmentPlan: plan, installmentPayments: [], soldBy: currentUserName, tableInfo: form.tableInfo,
       };
       setData({ ...data, sales: [...data.sales, sale], inventory: applySaleStockEffect(data.inventory, saleLinesOut, -1), invoiceCounter: counter });
       setViewing(sale);
@@ -3621,14 +3849,32 @@ function SalesTab({ data, setData, role, currentUserName, biz, can }) {
               <div className="text-sm font-semibold text-slate-700 mb-2 flex items-center gap-1.5">
                 <span>🔍</span> Add Item to Cart <span className="urdu text-slate-400 text-xs font-normal">/ آئٹم شامل کریں</span>
               </div>
+              {/* ---- Category Visual Grid (POS Quick Panels) — Settings -> Advanced Customization ->
+                   Feature Toggles -> "Category Visual Grid". Purely narrows availableItemsForPicker
+                   below; doesn't touch the cart, stock math, or anything outside this picker. ---- */}
+              {featureToggles.enableCategoryVisualGrid && pickerCategoryOptions.length > 0 && (
+                <div className="mb-3">
+                  <div className="text-xs font-medium text-slate-500 mb-1.5">Browse by Category <span className="urdu text-slate-400 font-normal">/ کیٹیگری کے مطابق</span></div>
+                  <div className="flex flex-wrap gap-2">
+                    <button type="button" onClick={() => setPickCategoryFilter("")} className={"text-xs font-medium px-3 py-2 rounded-lg border transition " + (pickCategoryFilter === "" ? "bg-[var(--accent-600)] border-[var(--accent-600)] text-white" : "bg-white border-slate-200 text-slate-600 hover:border-slate-300")}>
+                      All <span className="opacity-70">({availableItems.length})</span>
+                    </button>
+                    {pickerCategoryOptions.map(c => (
+                      <button key={c.name} type="button" onClick={() => setPickCategoryFilter(c.name)} className={"text-xs font-medium px-3 py-2 rounded-lg border transition " + (pickCategoryFilter === c.name ? "bg-[var(--accent-600)] border-[var(--accent-600)] text-white" : "bg-white border-slate-200 text-slate-600 hover:border-slate-300")}>
+                        {c.name} <span className="opacity-70">({c.count})</span>
+                      </button>
+                    ))}
+                  </div>
+                </div>
+              )}
               <SearchDropdown
-                items={availableItems}
+                items={availableItemsForPicker}
                 value={pickItemId}
-                onSelect={(id) => { setPickItemId(id); setPickQuantity("1"); }}
+                onSelect={(id) => { if (featureToggles.enableAutoAddToCart) { autoAddItemById(id); } else { setPickItemId(id); setPickQuantity("1"); } }}
                 getSearchText={i => [i.itemName, i.brand, i.model, i.imei1, i.imei2, i.serialNumber].join(" ")}
                 placeholder="Search item name, IMEI, or serial number..."
                 searchPlaceholder="Type item name, IMEI, or serial..."
-                emptyLabel="No matching items in stock"
+                emptyLabel={pickCategoryFilter ? "No matching items in \u201c" + pickCategoryFilter + "\u201d" : "No matching items in stock"}
                 renderSelected={(i) => <span className="text-sm font-medium text-slate-800">{i.itemName}{i.model ? <span className="text-slate-400 font-normal"> &middot; {i.model}</span> : null}</span>}
                 renderOption={(i) => {
                   const specs = [];
@@ -3646,10 +3892,13 @@ function SalesTab({ data, setData, role, currentUserName, biz, can }) {
                   );
                 }}
               />
-              {pickItem && pickIsSerialized && (
+              {featureToggles.enableAutoAddToCart && (
+                <div className="text-[11px] text-slate-400 mt-1.5">Selecting an item above adds it to the cart immediately — no extra click needed. Select a bulk item again to add one more unit.</div>
+              )}
+              {!featureToggles.enableAutoAddToCart && pickItem && pickIsSerialized && (
                 <div className="text-xs text-slate-500 mt-2">{pickCfg.idLabel || "IMEI / Serial"}: <span className="font-mono">{pickItem[pickCfg.idField] || "(none on file)"}</span> — serialized item, quantity is locked to 1.</div>
               )}
-              {pickItem && pickIsBulk && (
+              {!featureToggles.enableAutoAddToCart && pickItem && pickIsBulk && (
                 <div className="mt-2">
                   <span className="text-xs font-medium text-slate-600 block mb-1">Quantity <span className="urdu text-slate-400">/ تعداد</span></span>
                   <div className="flex items-center gap-2">
@@ -3660,7 +3909,7 @@ function SalesTab({ data, setData, role, currentUserName, biz, can }) {
                   </div>
                 </div>
               )}
-              {pickItem && (
+              {!featureToggles.enableAutoAddToCart && pickItem && (
                 <div className="mt-3">
                   <button type="button" onClick={addToCart} className="bg-[var(--accent-600)] hover:bg-[var(--accent-700)] text-white text-sm font-medium px-4 py-2 rounded-lg shadow-sm">+ Add to Cart</button>
                 </div>
@@ -3675,7 +3924,7 @@ function SalesTab({ data, setData, role, currentUserName, biz, can }) {
                 <span className="urdu text-slate-400 text-xs">/ ٹوکری</span>
               </div>
               {form.cart.length === 0 ? (
-                <div className="border border-dashed border-slate-300 rounded-xl py-6 text-center text-sm text-slate-400">No items added yet — search above and click "Add to Cart".</div>
+                <div className="border border-dashed border-slate-300 rounded-xl py-6 text-center text-sm text-slate-400">{featureToggles.enableAutoAddToCart ? "No items added yet — search above and select an item." : "No items added yet — search above and click \"Add to Cart\"."}</div>
               ) : (
                 <div className="space-y-2">
                   {form.cart.map(l => {
@@ -3735,6 +3984,9 @@ function SalesTab({ data, setData, role, currentUserName, biz, can }) {
               <div className="grid grid-cols-1 md:grid-cols-2 gap-x-4">
                 <Field label="System Invoice ID" ur="انوائس آئی ڈی"><TextInput disabled value={editingSaleId ? (data.sales.find(s => s.id === editingSaleId)?.invoiceId || "-") : padInvoice((data.invoiceCounter || 0) + 1) + " (auto)"} /></Field>
                 <Field label="Manual / Paper Receipt Number" ur="مینوئل رسید نمبر"><TextInput value={form.manualReceiptNumber} onChange={e => setForm({ ...form, manualReceiptNumber: e.target.value })} /></Field>
+                {loadJSON(CUSTOM_BUSINESS_TYPE_KEY, "mobile_shop") === "fast_food" && (
+                  <Field label="Table / Order Type" ur="ٹیبل / آرڈر"><TextInput value={form.tableInfo} onChange={e => setForm({ ...form, tableInfo: e.target.value })} placeholder="e.g. Table 5, Takeaway, Delivery" /></Field>
+                )}
                 <Field label={"Retail Price (" + form.cart.length + " item line" + (form.cart.length === 1 ? "" : "s") + ")"} ur="ریٹیل قیمت"><TextInput disabled value={fmtMoney(cartRetail)} /></Field>
                 <Field label="Discount / Less (overall)" ur="رعایت"><TextInput type="number" value={form.discount} onChange={e => setForm({ ...form, discount: e.target.value })} /></Field>
                 <Field label="Net Sale Price" ur="خالص قیمت"><TextInput disabled value={fmtMoney(netPrice)} className="font-semibold text-emerald-700" /></Field>
@@ -3826,6 +4078,7 @@ function SalesTab({ data, setData, role, currentUserName, biz, can }) {
             </div>
             <div>Customer: {viewing.customerName} {viewing.customerPhone}</div>
             <div>Manual Receipt #: {viewing.manualReceiptNumber || "-"}</div>
+            {viewing.tableInfo && <div>Table / Order: {viewing.tableInfo}</div>}
             <div>Retail: {fmtMoney(viewing.retailPrice)} | Discount: {fmtMoney(viewing.discount)} | Net: {fmtMoney(viewing.salePrice)}</div>
             <div>Type: {viewing.paymentType} | Sold By: {viewing.soldBy}</div>
             <div>Date: {fmtDate(viewing.date)}</div>
@@ -4617,9 +4870,10 @@ function togglePermAction(perms, moduleId, action, checked) {
    under whichever pill is active. */
 const SETTINGS_SECTIONS = [
   { id: "profile", label: "Profile & Branding", ur: "پروفائل", icon: "\u{1F3EC}" },
+  { id: "pos", label: "POS & Sales Preferences", ur: "سیلز کی ترجیحات", icon: "\u{1F6D2}" },
+  { id: "users", label: "Users & Access", ur: "رسائی", icon: "\u{1F465}" },
   { id: "license", label: "License & Subscription", ur: "لائسنس", icon: "\u{1F511}" },
   { id: "cloud", label: "Cloud Sync", ur: "کلاؤڈ", icon: "\u2601\uFE0F" },
-  { id: "users", label: "Users & Access", ur: "رسائی", icon: "\u{1F465}" },
   { id: "customitems", label: "Custom Items", ur: "آئٹمز", icon: "\u{1F3F7}\uFE0F" },
   { id: "display", label: "Customize Display", ur: "ڈسپلے", icon: "\u{1F39B}\uFE0F" },
   { id: "customization", label: "Advanced Customization", ur: "ایڈوانسڈ حسب ضرورت", icon: "\u{1F9E9}" },
@@ -4630,8 +4884,10 @@ const SETTINGS_SECTIONS = [
    contains or how it's rendered; a section's id, label, icon, and content block are exactly the
    same either way, so this is safe to reorganize freely without touching any settings logic. */
 const SETTINGS_CATEGORIES = [
-  { id: "business", label: "Business", ur: "کاروبار", icon: "\u{1F3E2}", sections: ["profile", "license", "cloud"] },
-  { id: "access", label: "Access Control", ur: "رسائی کنٹرول", icon: "\u{1F510}", sections: ["users"] },
+  { id: "business", label: "General & Business Profile", ur: "کاروبار کا پروفائل", icon: "\u{1F3E2}", sections: ["profile"] },
+  { id: "pos", label: "POS & Sales Preferences", ur: "سیلز کی ترجیحات", icon: "\u{1F6D2}", sections: ["pos"] },
+  { id: "access", label: "Staff & User Management", ur: "عملہ اور صارفین", icon: "\u{1F510}", sections: ["users"] },
+  { id: "cloudlicense", label: "Cloud Sync & License Status", ur: "کلاؤڈ اور لائسنس", icon: "\u2601\uFE0F", sections: ["license", "cloud"] },
   { id: "catalog", label: "Catalog", ur: "کیٹلاگ", icon: "\u{1F3F7}\uFE0F", sections: ["customitems"] },
   { id: "customize", label: "Customization", ur: "حسب ضرورت", icon: "\u{1F3A8}", sections: ["display", "customization"] },
   { id: "system", label: "System", ur: "سسٹم", icon: "\u2699\uFE0F", sections: ["advanced"] },
@@ -4641,24 +4897,25 @@ const SETTINGS_CATEGORIES = [
    receives `data`/setData, so it has no path to touch business records or Firebase sync. */
 function AdvancedCustomizationPanel({ uiPrefs, setAccentTheme, customTheme, setCustomTheme, role }) {
   const [subTab, setSubTab] = useState("presets");
-  const [businessType, setBusinessType] = useState(() => loadJSON(CUSTOM_BUSINESS_TYPE_KEY, "mobile_shop"));
-  function changeBusinessType(type) { setBusinessType(type); saveJSON(CUSTOM_BUSINESS_TYPE_KEY, type); }
+  // Read-only: Business Type is assigned exclusively by the Master Developer (see the listener
+  // in App() that syncs this down from Firestore) -- there is no writer for it anywhere in this panel.
+  const businessType = loadJSON(CUSTOM_BUSINESS_TYPE_KEY, "mobile_shop");
 
   const SUB_TABS = [
     { id: "presets", label: "Business Presets" },
     { id: "fields", label: "Field Customizer" },
     { id: "theme", label: "Theme & Layout" },
     { id: "nav", label: "Navigation Tabs" },
-    { id: "toggles", label: "Feature Toggles" },
+    { id: "toggles", label: "General & Login Toggles" },
   ];
 
   return (
     <div className="bg-white rounded-xl border border-slate-200 p-5">
       <div className="flex items-center justify-between mb-1">
         <h3 className="text-sm font-semibold text-slate-700">Advanced Customization <span className="urdu text-slate-400 text-xs">/ ایڈوانسڈ حسب ضرورت</span></h3>
-        <span className="text-[10px] px-2 py-1 rounded-full bg-emerald-100 text-emerald-700 shrink-0">LocalStorage only &middot; isolated from Firebase</span>
+        <span className="text-[10px] px-2 py-1 rounded-full bg-emerald-100 text-emerald-700 shrink-0">Mostly local &middot; Business Type is developer-assigned</span>
       </div>
-      <p className="text-xs text-slate-500 mb-4">Configuration and live previews for Business Presets, optional-field customization, Dark Mode/Font Size/Widget Layout, and Navigation Tabs. Saved to this browser only, under its own storage keys — completely separate from your business data, cloud sync, and everyone else's Customize Display preferences above.</p>
+      <p className="text-xs text-slate-500 mb-4">Configuration and live previews for Business Presets, optional-field customization, Dark Mode/Font Size/Widget Layout, and Navigation Tabs. Saved to this browser only, under its own storage keys — separate from your business data and cloud sync. The one exception is <b>Business Type</b> itself, shown read-only below: it's assigned by your service provider via the Master Developer Panel and synced down automatically.</p>
 
       <div className="flex flex-wrap gap-2 mb-5 border-b border-slate-200 pb-4">
         {SUB_TABS.map(s => (
@@ -4669,16 +4926,16 @@ function AdvancedCustomizationPanel({ uiPrefs, setAccentTheme, customTheme, setC
         ))}
       </div>
 
-      {subTab === "presets" && <CustomBusinessPresetsSection businessType={businessType} onChangeBusinessType={changeBusinessType} />}
+      {subTab === "presets" && <CustomBusinessPresetsSection businessType={businessType} />}
       {subTab === "fields" && <CustomFieldCustomizerSection />}
       {subTab === "theme" && <CustomThemeLayoutSection uiPrefs={uiPrefs} setAccentTheme={setAccentTheme} customTheme={customTheme} setCustomTheme={setCustomTheme} />}
-      {subTab === "nav" && <CustomNavigationTabsSection businessType={businessType} onChangeBusinessType={changeBusinessType} />}
-      {subTab === "toggles" && <CustomFeatureTogglesSection role={role} />}
+      {subTab === "nav" && <CustomNavigationTabsSection businessType={businessType} />}
+      {subTab === "toggles" && <CustomFeatureTogglesSection role={role} sections={["general", "auth"]} />}
     </div>
   );
 }
 
-function CustomBusinessPresetsSection({ businessType, onChangeBusinessType }) {
+function CustomBusinessPresetsSection({ businessType }) {
   const bt = CUSTOM_BUSINESS_TYPES[businessType];
   const otherProfile = businessType === "other" ? loadOtherBusinessProfile() : null;
   const displayCategories = otherProfile ? otherProfile.categories : bt.categories;
@@ -4691,10 +4948,11 @@ function CustomBusinessPresetsSection({ businessType, onChangeBusinessType }) {
     <div className="space-y-5">
       <div>
         <label className="text-xs text-slate-500 block mb-1">Business Type</label>
-        <select value={businessType} onChange={e => onChangeBusinessType(e.target.value)} className="w-full sm:w-72 border border-slate-300 rounded-lg px-3 py-2 text-sm bg-white">
-          {Object.values(CUSTOM_BUSINESS_TYPES).map(o => <option key={o.id} value={o.id}>{o.label}</option>)}
-        </select>
-        <p className="text-[11px] text-slate-400 mt-1">Also drives which tabs Navigation Tabs offers below (Repairing / Pharmacy &amp; Formula).</p>
+        <div className="w-full sm:w-72 border border-slate-200 rounded-lg px-3 py-2 text-sm bg-slate-50 text-slate-700 flex items-center justify-between">
+          <span>{(CUSTOM_BUSINESS_TYPES[businessType] || CUSTOM_BUSINESS_TYPES.mobile_shop).label}</span>
+          <span className="text-slate-400 text-xs" title="Assigned by your service provider">{"\u{1F512}"}</span>
+        </div>
+        <p className="text-[11px] text-slate-400 mt-1">Locked — assigned by your service provider via the Master Developer Panel, not editable here. Also drives which tabs Navigation Tabs offers below (Repairing / Pharmacy &amp; Formula).</p>
       </div>
 
       <div className="rounded-lg border border-slate-200 overflow-x-auto">
@@ -4921,7 +5179,7 @@ function CustomThemeLayoutSection({ uiPrefs, setAccentTheme, customTheme, setCus
   );
 }
 
-function CustomNavigationTabsSection({ businessType, onChangeBusinessType }) {
+function CustomNavigationTabsSection({ businessType }) {
   const [visibility, setVisibility] = useState(customLoadNavPrefs);
   function toggle(id, visible) { const next = { ...visibility, [id]: visible }; setVisibility(next); saveJSON(CUSTOM_NAV_PREFS_KEY, next); }
   const relevant = customTabsForType(businessType);
@@ -4931,10 +5189,11 @@ function CustomNavigationTabsSection({ businessType, onChangeBusinessType }) {
     <div className="space-y-4">
       <div>
         <label className="text-xs text-slate-500 block mb-1">Business Type</label>
-        <select value={businessType} onChange={e => onChangeBusinessType(e.target.value)} className="w-full sm:w-72 border border-slate-300 rounded-lg px-3 py-2 text-sm bg-white">
-          {Object.values(CUSTOM_BUSINESS_TYPES).map(o => <option key={o.id} value={o.id}>{o.label}</option>)}
-        </select>
-        <p className="text-[11px] text-slate-400 mt-1">Repairing only appears for Mobile Shop; Pharmacy / Formula only for Pharmacy.</p>
+        <div className="w-full sm:w-72 border border-slate-200 rounded-lg px-3 py-2 text-sm bg-slate-50 text-slate-700 flex items-center justify-between">
+          <span>{(CUSTOM_BUSINESS_TYPES[businessType] || CUSTOM_BUSINESS_TYPES.mobile_shop).label}</span>
+          <span className="text-slate-400 text-xs" title="Assigned by your service provider">{"\u{1F512}"}</span>
+        </div>
+        <p className="text-[11px] text-slate-400 mt-1">Locked — assigned by your service provider. Repairing only appears for Mobile Shop; Pharmacy / Formula only for Pharmacy.</p>
       </div>
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-5">
         <div className="space-y-1.5">
@@ -4956,7 +5215,12 @@ function CustomNavigationTabsSection({ businessType, onChangeBusinessType }) {
   );
 }
 
-function CustomFeatureTogglesSection({ role }) {
+/* `sections` optionally limits which groups render — e.g. ["module"] on the new POS & Sales
+   Preferences settings page, so General/Login toggles (which live in Advanced Customization ->
+   Feature Toggles, unchanged) aren't duplicated there. Defaults to all three, unchanged from
+   before, for the original Advanced Customization -> Feature Toggles subtab. */
+function CustomFeatureTogglesSection({ role, sections }) {
+  const show = (id) => !sections || sections.includes(id);
   const isAdmin = role === "Admin";
   const [toggles, setToggles] = useState(loadFeatureToggles);
   const [auditLog, setAuditLog] = useState(() => loadJSON(AUDIT_LOG_KEY, []));
@@ -4980,10 +5244,13 @@ function CustomFeatureTogglesSection({ role }) {
     { key: "enableInstallments", label: "Installment Sales", ur: "قسط پر فروخت", note: "Offers \"Installment\" as a Payment Type on new sales. Existing installment sales and the Recovery tab stay fully usable either way." },
     { key: "enableWhatsAppShare", label: "WhatsApp Receipt Sharing", ur: "واٹس ایپ رسید", note: "Shows the WhatsApp Receipt / WhatsApp Image Receipt buttons on sale views." },
     { key: "enablePaymentReminders", label: "Payment Reminders", ur: "ادائیگی کی یاد دہانی", note: "Shows the WhatsApp payment-reminder buttons and the Dashboard's Due Reminders card." },
+    { key: "enableAutoAddToCart", label: "Auto-Add Item on Selection", ur: "منتخب کرتے ہی ٹوکری میں شامل کریں", note: "On the Sales screen, selecting an item from the search list adds it straight to the cart — no \"Add to Cart\" click needed. Selecting the same bulk item again adds one more unit; serialized items (IMEI/Serial) reset the search after adding." },
+    { key: "enableCategoryVisualGrid", label: "Category Visual Grid", ur: "کیٹیگری ویژول گرڈ", note: "Shows a grid of clickable category boxes at the top of the Sales screen's item picker. Tapping one filters the item search down to just that category, instead of listing everything in stock at once." },
   ];
 
   return (
     <div className="space-y-5">
+      {show("general") && (
       <div>
         <h4 className="text-xs font-semibold text-slate-500 uppercase tracking-wide mb-1 px-0.5">General</h4>
         <div className="divide-y divide-slate-100">
@@ -4995,7 +5262,9 @@ function CustomFeatureTogglesSection({ role }) {
           ))}
         </div>
       </div>
+      )}
 
+      {show("auth") && (
       <div>
         <h4 className="text-xs font-semibold text-slate-500 uppercase tracking-wide mb-1 px-0.5">Login &amp; Auth</h4>
         <div className="divide-y divide-slate-100">
@@ -5011,7 +5280,9 @@ function CustomFeatureTogglesSection({ role }) {
           ))}
         </div>
       </div>
+      )}
 
+      {show("module") && (
       <div>
         <h4 className="text-xs font-semibold text-slate-500 uppercase tracking-wide mb-1 px-0.5">Modules &amp; Receipt Options</h4>
         <div className="divide-y divide-slate-100">
@@ -5024,6 +5295,7 @@ function CustomFeatureTogglesSection({ role }) {
         </div>
         <p className="text-[11px] text-slate-400 mt-2">Which tabs appear in the sidebar is controlled separately, per business type, in <b>Navigation Tabs</b> above.</p>
       </div>
+      )}
 
       <div className="rounded-lg border border-slate-200 p-4">
         <div className="flex items-center justify-between mb-2">
@@ -5129,7 +5401,7 @@ function CurrencySettingCard() {
     </div>
   );
 }
-function SettingsTab({ businesses, setBusinesses, currentBiz, setCurrentBizId, users, setUsers, currentUser, cloudUser, onCloudLogout, cloudStatus, isOnline, onSyncNow, data, setData, uiPrefs, setUiPrefs, customTheme, setCustomTheme }) {
+function SettingsTab({ businesses, setBusinesses, currentBiz, setCurrentBizId, users, setUsers, currentUser, cloudUser, onCloudLogout, cloudStatus, isOnline, onSyncNow, data, setData, uiPrefs, setUiPrefs, customTheme, setCustomTheme, cloudShopAccount, onDisconnectShopAccount }) {
   const [form, setForm] = useState(currentBiz);
   const [newBizName, setNewBizName] = useState("");
   useEffect(() => { setForm(currentBiz); }, [currentBiz.id]);
@@ -5152,14 +5424,13 @@ function SettingsTab({ businesses, setBusinesses, currentBiz, setCurrentBizId, u
     const result = activateLicenseKey(licenseKeyInput);
     if (!result.ok) { setLicenseError(result.error); return; }
     setLicense(result.state); setLicenseKeyInput("");
+    cloudPushActivation(cloudShopId(currentBiz), currentBiz.name, result.state); // best-effort, powers the developer dashboard's Activated Shops list
   }
   function removeLicense() {
     if (!confirm("Remove this license and go back to the Free plan?")) return;
-    setLicense(deactivateLicense());
-  }
-  /* Admin/Developer Master Control — instant Free <-> Premium flip, no key required. */
-  function toggleAdminOverride(nextIsPremium) {
-    setLicense(setLicenseOverride(nextIsPremium));
+    const state = deactivateLicense();
+    setLicense(state);
+    cloudPushActivation(cloudShopId(currentBiz), currentBiz.name, state);
   }
 
   function openAddUser() { setUserForm(blankUserForm()); setEditingUser(null); setShowUserForm(true); }
@@ -5245,6 +5516,11 @@ function SettingsTab({ businesses, setBusinesses, currentBiz, setCurrentBizId, u
               </div>
               <div className="space-y-0.5">
                 {cat.sections.map(sid => {
+                  // License & Subscription is business-owner-only: it shows the raw activation
+                  // key and lets whoever's looking at it downgrade to Free, so it's hidden from
+                  // any non-Admin the Admin has given "Business Settings" view access to, even
+                  // though the rest of that category (Profile, Cloud Sync) stays visible to them.
+                  if (sid === "license" && currentUser.role !== "Admin") return null;
                   const s = SETTINGS_SECTIONS.find(x => x.id === sid);
                   if (!s) return null;
                   const active = activeSection === s.id;
@@ -5270,7 +5546,7 @@ function SettingsTab({ businesses, setBusinesses, currentBiz, setCurrentBizId, u
             </div>
           )}
 
-      {activeSection === "license" && (
+      {activeSection === "license" && currentUser.role === "Admin" && (
       <div className="space-y-4">
         <div className="bg-white rounded-xl border border-slate-200 p-5">
           <div className="flex items-center justify-between gap-3 mb-3">
@@ -5282,30 +5558,52 @@ function SettingsTab({ businesses, setBusinesses, currentBiz, setCurrentBizId, u
             <div className="text-sm text-slate-600 space-y-2">
               <div>Premium is active on this device. Every Premium module below is fully unlocked.</div>
               <div className="text-xs text-slate-400">
-                {license.source === "admin_override" ? "Activated via Admin Override" : <>Activation key: <span className="font-mono">{license.key}</span></>}
+                {license.source === "admin_override" ? "Activated by your Anjum Webs POS developer" : <>Activation key: <span className="font-mono">{license.key}</span></>}
                 {license.activatedAt ? " \u00b7 activated " + new Date(license.activatedAt).toLocaleDateString() : ""}
               </div>
+              {license.expiresAt
+                ? <div className="text-xs text-amber-600">Valid until {new Date(license.expiresAt).toLocaleDateString()}</div>
+                : <div className="text-xs text-emerald-600">Lifetime \u2014 never expires</div>}
               <button onClick={removeLicense} className="text-xs px-3 py-1.5 rounded-lg border border-slate-300 text-rose-600 hover:bg-rose-50 mt-1">Remove License / Downgrade to Free</button>
             </div>
           ) : (
             <div>
+              {license.source === "expired" && (
+                <div className="bg-amber-50 text-amber-700 border border-amber-100 rounded-lg px-3 py-2 text-xs mb-3">
+                  Your Premium license expired on {license.lastExpiresAt ? new Date(license.lastExpiresAt).toLocaleDateString() : "-"}. Enter a new activation key below to continue on Premium.
+                </div>
+              )}
               <p className="text-sm text-slate-600 mb-3">You're on the Free plan. Enter an activation key below to unlock every Premium module instantly on this device.</p>
               <div className="flex flex-col sm:flex-row gap-2 max-w-md">
                 <TextInput placeholder="ZM-XXXX-XXXX-XXXX" value={licenseKeyInput} onChange={e => { setLicenseKeyInput(e.target.value); setLicenseError(""); }} />
                 <button onClick={submitLicenseKey} className="bg-[var(--accent-600)] hover:bg-[var(--accent-700)] text-white text-sm font-medium px-4 py-2 rounded-lg whitespace-nowrap">Activate</button>
               </div>
               {licenseError && <div className="text-xs text-rose-500 mt-2">{licenseError}</div>}
-              <p className="text-[11px] text-slate-400 mt-3">Demo/testing key: <span className="font-mono">ZM-PREM-2026-01LR</span></p>
+              <p className="text-[11px] text-slate-400 mt-3">Don't have a key? Contact your Anjum Webs POS developer to purchase one.</p>
             </div>
           )}
         </div>
 
-        {currentUser.role === "Admin" && (
-          <div className="bg-white rounded-xl border border-amber-200 p-5">
-            <h3 className="text-sm font-semibold text-slate-700 mb-1">Developer / Admin Master Control <span className="urdu text-slate-400 text-xs">/ ایڈمن کنٹرول</span></h3>
-            <p className="text-xs text-slate-500 mb-3">Admin-only. Instantly flips this account between Free and Premium for testing or direct client management — no activation key needed. Overrides (and is overridden by) whatever the license key above set.</p>
-            <ToggleSwitch label={license.isPremium ? "Premium (forced on)" : "Force Premium On"} ur="پریمیم زبردستی آن" checked={license.isPremium} onChange={v => toggleAdminOverride(v)} />
-            <p className="text-[11px] text-amber-600 mt-2">This is a local, device-only override for testing/admin use — it bypasses key validation entirely and is not a substitute for real license enforcement in production.</p>
+        {/* ---- Master Shop Account (Smart Persistent Session) ----
+            Shows which shop username this device is currently activated/remembered as (see
+            Master Cloud Login / ShopActivationScreen), and lets the owner deliberately sign this
+            exact device out of it via Disconnect Device (onDisconnectShopAccount, wired to
+            handleDisconnectShopAccount in App()). Staff logging in/out day-to-day never touches
+            this — that's the separate "Logout" button in the top header — this is specifically
+            for unlinking the device itself from the developer-issued shop account. */}
+        {cloudShopAccount && (
+          <div className="bg-white rounded-xl border border-slate-200 p-5">
+            <h3 className="text-sm font-semibold text-slate-700 mb-1">Master Shop Account <span className="urdu text-slate-400 text-xs">/ ماسٹر شاپ اکاؤنٹ</span></h3>
+            <p className="text-xs text-slate-500 mb-3">This device is remembered as this shop &mdash; staff bypass the Master Developer login and land straight on the dashboard whenever they open the app here, even offline.</p>
+            <div className="flex items-center justify-between bg-slate-50 rounded-lg px-3 py-2.5 border border-slate-200 mb-3">
+              <div>
+                <div className="text-sm font-semibold text-slate-700">{cloudShopAccount.shopName || currentBiz.name}</div>
+                <div className="text-xs text-slate-400">Shop username: <span className="font-mono">{cloudShopAccount.username}</span></div>
+              </div>
+              <span className="text-[10px] px-2 py-1 rounded-full bg-emerald-100 text-emerald-700 whitespace-nowrap">Connected</span>
+            </div>
+            <button onClick={onDisconnectShopAccount} className="text-xs px-3 py-1.5 rounded-lg border border-slate-300 text-rose-600 hover:bg-rose-50">Disconnect This Device</button>
+            <p className="text-[11px] text-slate-400 mt-2">This signs this device out of the Master Shop Account. You'll need the shop username &amp; password from your service provider to activate it again. Business data already saved on this device is not deleted.</p>
           </div>
         )}
 
@@ -5412,12 +5710,15 @@ function SettingsTab({ businesses, setBusinesses, currentBiz, setCurrentBizId, u
       /* Custom Items & Categories now lives here in Settings (previously its own sidebar tab) —
          same component, same data, just relocated. Gated by the "settings" module's own
          Add/Edit/Delete permissions rather than a separate "customitems" permission column. */
+      <PremiumGate featureId="businessSettings" isPremium={license.isPremium}>
       <div className="mb-6">
         <CustomItemsTab data={data} setData={setData} role={currentUser.role} can={a => can(currentUser, "settings", a)} />
       </div>
+      </PremiumGate>
       )}
 
       {activeSection === "users" && (
+      <PremiumGate featureId="businessSettings" isPremium={license.isPremium}>
       <>
       {currentUser.role === "Admin" && users.some(u => u.status === "Pending") && (
         <div className="bg-white rounded-xl border border-amber-200 p-5 mb-6">
@@ -5511,9 +5812,11 @@ function SettingsTab({ businesses, setBusinesses, currentBiz, setCurrentBizId, u
         </div>
       )}
       </>
+      </PremiumGate>
       )}
 
       {activeSection === "display" && (
+      <PremiumGate featureId="businessSettings" isPremium={license.isPremium}>
       <div className="bg-white rounded-xl border border-slate-200 p-5 mb-6">
         <div className="flex items-center justify-between mb-1">
           <h3 className="text-sm font-semibold text-slate-700">Customize Display <span className="urdu text-slate-400 text-xs">/ ڈسپلے کو حسب ضرورت بنائیں</span></h3>
@@ -5563,13 +5866,29 @@ function SettingsTab({ businesses, setBusinesses, currentBiz, setCurrentBizId, u
           ))}
         </div>
       </div>
+      </PremiumGate>
+      )}
+
+      {activeSection === "pos" && (
+      <PremiumGate featureId="businessSettings" isPremium={license.isPremium}>
+      <div className="bg-white rounded-xl border border-slate-200 p-5">
+        <div className="flex items-center justify-between mb-1">
+          <h3 className="text-sm font-semibold text-slate-700">POS & Sales Preferences</h3>
+        </div>
+        <p className="text-xs text-slate-500 mb-4">Switches that change how the Sales screen behaves — Auto-Add, the Category Visual Grid, Installments, and receipt/reminder options below. Everything here is saved to this device.</p>
+        <CustomFeatureTogglesSection role={currentUser.role} sections={["module"]} />
+      </div>
+      </PremiumGate>
       )}
 
       {activeSection === "customization" && (
+        <PremiumGate featureId="businessSettings" isPremium={license.isPremium}>
         <AdvancedCustomizationPanel uiPrefs={uiPrefs} setAccentTheme={setAccentTheme} customTheme={customTheme} setCustomTheme={setCustomTheme} role={currentUser.role} />
+        </PremiumGate>
       )}
 
       {activeSection === "advanced" && (
+      <PremiumGate featureId="businessSettings" isPremium={license.isPremium}>
       <div className="bg-white rounded-xl border border-slate-200 p-5">
         <div className="flex items-center justify-between mb-2">
           <h3 className="text-sm font-semibold text-slate-700">Local Storage / لوکل اسٹوریج</h3>
@@ -5578,6 +5897,7 @@ function SettingsTab({ businesses, setBusinesses, currentBiz, setCurrentBizId, u
         <p className="text-xs text-slate-500 mb-3">This app runs entirely in your browser — there is no cloud database and no external server involved. Every business, sale, customer, and photo is saved to this browser's LocalStorage on this device and reloads instantly next time you open the page. Use <b>Backup / Export</b> to save a JSON copy or move data to another device.</p>
         <p className="text-xs text-slate-500">Looking for Sales, Purchase, Recovery, Customer, and other downloadable reports? They're in the <b>Backup &amp; Export</b> tab (sidebar, next to Settings) &rarr; <b>Reports</b>, including a "Download All" option.</p>
       </div>
+      </PremiumGate>
       )}
 
 
@@ -6049,6 +6369,7 @@ function ExportTab({ data, currentBiz, setData }) {
       )}
 
       {activeSection === "backup" && (
+        <PremiumGate featureId="backupRestore" isPremium={loadLicenseState().isPremium}>
         <div className="space-y-4">
           <div className="bg-white rounded-xl border border-slate-200 p-5">
             <h3 className="text-sm font-semibold text-slate-700 mb-1">Export Backup <span className="urdu text-slate-400 text-xs">/ مکمل بیک اپ</span></h3>
@@ -6081,9 +6402,11 @@ function ExportTab({ data, currentBiz, setData }) {
             </div>
           </div>
         </div>
+        </PremiumGate>
       )}
 
       {activeSection === "import" && (
+        <PremiumGate featureId="importMerge" isPremium={loadLicenseState().isPremium}>
         <div className="bg-white rounded-xl border border-slate-200 p-5">
           <h3 className="text-sm font-semibold text-slate-700 mb-1">Import / Merge from CSV or Excel <span className="urdu text-slate-400 text-xs">/ ڈیٹا امپورٹ</span></h3>
           <p className="text-xs text-slate-500 mb-3">One table at a time — pick exactly which table to update. Records matched by IMEI/Serial (stock), phone (customers), or name (dealers/accounts) are updated in place; everything else is added as new. Dealer Ledger Payments are historical transactions, so each row is always appended as a new ledger entry rather than merged.</p>
@@ -6097,6 +6420,7 @@ function ExportTab({ data, currentBiz, setData }) {
             <div><label className="text-sm text-slate-700 block mb-1">Import Installment Payments (adds new entries — columns: invoiceId, amount, date, accountName, manualReceiptNumber)</label><input type="file" accept=".csv,.xlsx,.xls,.json" onChange={e => handleTableImport(e, "installments")} className="text-sm" /></div>
           </div>
         </div>
+        </PremiumGate>
       )}
 
       <p className="text-xs text-slate-400 mt-4">All data is stored locally in this browser (LocalStorage) and persists automatically between sessions on this device.</p>
@@ -6265,6 +6589,65 @@ function ForgotPasswordPanel({ users, onResetPassword, onBack }) {
    Completion (or explicit skip) is recorded in SETUP_WIZARD_KEY so it never appears
    again on this browser. Purely additive: it edits the same `businesses`/`users`
    state App() already manages, via the setters passed in. */
+
+/* ============================ SHOP ACTIVATION SCREEN (Master Cloud Login) ============
+   The very first thing anyone sees on a device that hasn't activated yet — before the Setup
+   Wizard, before the daily staff Login screen, before anything else. Verifies the shop username
+   & password the Master Developer created against the shared Firestore database (see
+   attemptShopLogin above). Success caches the account locally and hands control back to App(),
+   which seeds Business Type / Premium status from it and moves on to the (now mandatory) Setup
+   Wizard so the owner can create their own local Admin login for daily use. */
+function ShopActivationScreen({ onActivated }) {
+  const [username, setUsername] = useState("");
+  const [password, setPassword] = useState("");
+  const [error, setError] = useState("");
+  const [checking, setChecking] = useState(false);
+  const [isOnline, setIsOnline] = useState(() => (typeof navigator !== "undefined" ? navigator.onLine : true));
+  useEffect(() => {
+    function on() { setIsOnline(true); } function off() { setIsOnline(false); }
+    window.addEventListener("online", on); window.addEventListener("offline", off);
+    return () => { window.removeEventListener("online", on); window.removeEventListener("offline", off); };
+  }, []);
+
+  async function submit(e) {
+    e.preventDefault();
+    setChecking(true);
+    const result = await attemptShopLogin(username, password, isOnline);
+    setChecking(false);
+    if (!result.ok) { setError(result.error); return; }
+    setError("");
+    onActivated(result.data);
+  }
+
+  return (
+    <div className="min-h-screen relative flex items-center justify-center p-4 overflow-hidden bg-[linear-gradient(160deg,#0f172a,#111827_55%,#0c1e1c)]">
+      <div className="pointer-events-none absolute -top-24 -left-20 w-80 h-80 rounded-full bg-emerald-500/10 blur-3xl"></div>
+      <div className="pointer-events-none absolute -bottom-28 -right-16 w-96 h-96 rounded-full bg-teal-400/10 blur-3xl"></div>
+      <div className="relative w-full max-w-sm">
+        <div className="bg-white/[0.98] backdrop-blur rounded-3xl shadow-2xl ring-1 ring-black/5 w-full p-7">
+          <div className="w-12 h-12 rounded-2xl bg-gradient-to-br from-emerald-500 to-teal-600 flex items-center justify-center text-2xl mb-4 shadow-lg shadow-emerald-500/20">{"\u{1F3EA}"}</div>
+          <h1 className="text-xl font-bold text-slate-800 mb-1">Activate Your Shop</h1>
+          <p className="text-sm text-slate-500 mb-5">Sign in with the shop username &amp; password provided by your service provider. This device stays signed in afterward, including offline.</p>
+          <form onSubmit={submit}>
+            <div className="mb-3">
+              <label className="block text-xs font-medium text-slate-500 mb-1">Shop Username</label>
+              <input type="text" autoFocus autoCapitalize="none" autoCorrect="off" value={username} onChange={e => { setUsername(e.target.value); setError(""); }} className="w-full border border-slate-200 rounded-xl px-3 py-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-emerald-500/40" placeholder="e.g. alitraders" />
+            </div>
+            <div className="mb-2">
+              <label className="block text-xs font-medium text-slate-500 mb-1">Password</label>
+              <input type="password" value={password} onChange={e => { setPassword(e.target.value); setError(""); }} className="w-full border border-slate-200 rounded-xl px-3 py-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-emerald-500/40" placeholder="Password" />
+            </div>
+            {!isOnline && <div className="text-xs text-amber-600 bg-amber-50 rounded-lg px-3 py-2 mt-2">No internet connection detected. Activation only works offline if this exact device has activated successfully before.</div>}
+            {error && <div className="text-xs text-rose-600 bg-rose-50 rounded-lg px-3 py-2 mt-2">{error}</div>}
+            <button type="submit" disabled={checking || !username || !password} className="w-full mt-4 bg-emerald-600 hover:bg-emerald-700 disabled:opacity-50 text-white text-sm font-semibold px-4 py-2.5 rounded-xl transition">{checking ? "Verifying\u2026" : "Activate"}</button>
+          </form>
+          <p className="text-[11px] text-slate-400 text-center mt-4">Don't have shop credentials yet? Contact your service provider to get a username and password set up for this shop.</p>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 function SetupWizard({ biz, setBusinesses, users, setUsers, onComplete }) {
   const [step, setStep] = useState(1); // 1 welcome | 2 business details | 3 authentication/security | 4 business type
   const STEP_COUNT = 4;
@@ -6325,25 +6708,16 @@ function SetupWizard({ biz, setBusinesses, users, setUsers, onComplete }) {
   }
 
   /* ---- step 4 (final): Business Type ----
-     Saves to the SAME isolated LocalStorage key (CUSTOM_BUSINESS_TYPE_KEY) that Inventory, Sales,
-     Purchases, and Advanced Customization already read on every render (see categoryConfig() /
-     allCategories() / getBusinessAccessoryOptions() near the top of this script) — so the moment
-     this step is saved and the wizard closes, the very next screen the person sees (the Dashboard)
-     already reflects the right categories, ID fields (IMEI/Serial/none), and extra fields
-     (expiry date, batch number, size/dimensions, etc.) for their trade. Nothing else needs to
-     change or reload for this to take effect; it's the same mechanism the "Business Type" quick
-     switcher on the Inventory page and Business Presets in Settings already use. Can always be
-     changed again later from either of those places — this step just sets the starting point. */
+     No longer a picker here — Business Type is assigned exclusively by the Master Developer from
+     the private zahidy-developer-dashboard.html and synced down automatically (see the listener
+     in App()). Until that happens, the app quietly uses its existing "mobile_shop" default so a
+     brand-new shop isn't blocked from finishing setup while waiting on that assignment. */
   const BUSINESS_TYPE_ICONS = {
     mobile_shop: "\u{1F4F1}", pharmacy: "\u{1F48A}", crockery: "\u{1F37D}\uFE0F", grocery: "\u{1F6D2}",
     general_store: "\u{1F3EA}", tiles_ceramics: "\u{1F9F1}", ceiling_paneling: "\u{1F3E0}", hotel: "\u{1F3E8}",
     fast_food: "\u{1F354}", other: "\u{1F9E9}",
   };
-  const [businessType, setBusinessTypeStep] = useState(() => loadJSON(CUSTOM_BUSINESS_TYPE_KEY, "mobile_shop"));
-  function finishWithBusinessType() {
-    saveJSON(CUSTOM_BUSINESS_TYPE_KEY, businessType);
-    finish();
-  }
+  const currentBusinessType = loadJSON(CUSTOM_BUSINESS_TYPE_KEY, "mobile_shop");
 
   function finish() { saveJSON(SETUP_WIZARD_KEY, true); onComplete(); }
 
@@ -6446,27 +6820,22 @@ function SetupWizard({ biz, setBusinesses, users, setUsers, onComplete }) {
           {/* ---- Step 4: Business Type (final step) ---- */}
           {step === 4 && (
             <div>
-              <h2 className="text-lg font-bold text-slate-800 mb-1">What kind of business is this?</h2>
+              <h2 className="text-lg font-bold text-slate-800 mb-1">Business Type</h2>
               <p className="text-xs text-slate-500 mb-5">
-                This adjusts Inventory categories, item fields (like IMEI, expiry date, or size/dimensions),
-                and a few Dashboard defaults to match your trade. You can change this anytime later from
-                Settings &rarr; Advanced Customization, or from the switcher on the Inventory page.
+                This adjusts Inventory categories, item fields (like IMEI, expiry date, or size/dimensions), and a
+                few Dashboard defaults to match your trade. It's assigned by your service provider and applied
+                automatically — there's nothing to pick here.
               </p>
-              <div className="grid grid-cols-2 gap-2 mb-5 max-h-72 overflow-y-auto pr-1">
-                {Object.values(CUSTOM_BUSINESS_TYPES).map(bt => (
-                  <button key={bt.id} type="button" onClick={() => setBusinessTypeStep(bt.id)}
-                    className={"flex flex-col items-center justify-center gap-1.5 text-center px-3 py-4 rounded-xl border-2 transition " +
-                      (businessType === bt.id ? "border-teal-500 bg-teal-50 shadow-sm" : "border-slate-150 bg-slate-50 hover:bg-slate-100 border-slate-100")}>
-                    <span className="text-2xl">{BUSINESS_TYPE_ICONS[bt.id] || "\u{1F3EA}"}</span>
-                    <span className={"text-xs font-medium leading-tight " + (businessType === bt.id ? "text-teal-700" : "text-slate-600")}>{bt.label}</span>
-                  </button>
-                ))}
+              <div className="flex flex-col items-center justify-center gap-2 mb-5 px-3 py-8 rounded-xl border-2 border-slate-100 bg-slate-50 text-center">
+                <span className="text-3xl">{BUSINESS_TYPE_ICONS[currentBusinessType] || "\u{1F3EA}"}</span>
+                <span className="text-sm font-medium text-slate-700">{(CUSTOM_BUSINESS_TYPES[currentBusinessType] || CUSTOM_BUSINESS_TYPES.mobile_shop).label}</span>
+                <span className="flex items-center gap-1 text-[11px] text-slate-400">{"\u{1F512}"} Locked — set by your service provider</span>
               </div>
               <div className="flex gap-2 mt-2">
                 <button type="button" onClick={() => setStep(3)} className="flex-1 bg-slate-100 hover:bg-slate-200 active:scale-[0.98] text-slate-600 text-sm font-semibold px-4 py-3 rounded-xl transition">&larr; Back</button>
-                <button type="button" onClick={finishWithBusinessType} className="flex-[2] bg-[linear-gradient(135deg,#0f766e,#0d9488,#0891b2)] hover:brightness-110 active:scale-[0.98] text-white text-sm font-semibold px-4 py-3 rounded-xl shadow-lg shadow-teal-900/20 transition">Finish Setup</button>
+                <button type="button" onClick={finish} className="flex-[2] bg-[linear-gradient(135deg,#0f766e,#0d9488,#0891b2)] hover:brightness-110 active:scale-[0.98] text-white text-sm font-semibold px-4 py-3 rounded-xl shadow-lg shadow-teal-900/20 transition">Finish Setup</button>
               </div>
-              <p className="text-[11px] text-slate-400 text-center mt-3">Not sure, or your trade isn't listed? Pick "Other / General Business" &mdash; you can name it and customize its categories afterward in Settings.</p>
+              <p className="text-[11px] text-slate-400 text-center mt-3">If this isn't right, contact your service provider — they can update it from their end at any time.</p>
             </div>
           )}
         </div>
@@ -6482,7 +6851,10 @@ function LoginScreen({ users, setUsers, onLogin, onResetPassword, biz, cloudUser
   const [error, setError] = useState("");
   const featureToggles = loadFeatureToggles();
   const [mode, setMode] = useState("login"); // login | forgot | register
-  const isDefaultAdmin = users.length === 1 && users[0].username === "admin" && users[0].password === "admin123";
+  // No literal "admin"/"admin123" default exists anymore (see loadUsers) — this now just detects
+  // an admin account that has never had its password set via SetupWizard or Manage Users, so the
+  // Login screen can point people there instead of showing a credential that doesn't exist.
+  const isDefaultAdmin = users.length === 1 && users[0].username === "admin" && !loadJSON(SETUP_WIZARD_KEY, false);
 
   /* Self-registration: anyone can request an account, but it starts life as "Pending" and can't
      sign in until an Admin approves it from Settings -> Manage Users. Defaults to the least-
@@ -6633,7 +7005,7 @@ function LoginScreen({ users, setUsers, onLogin, onResetPassword, biz, cloudUser
                   {featureToggles.enableSelfRegistration && <button type="button" onClick={() => setMode("register")} className="text-teal-700 hover:underline font-medium">Sign Up / Register</button>}
                 </div>
               )}
-              {isDefaultAdmin && <div className="text-xs text-slate-400 mt-4 text-center bg-slate-50 rounded-xl px-3 py-2">Default login: <b>admin</b> / <b>admin123</b><br />Please change this password after logging in (Settings &rarr; Manage Users).</div>}
+              {isDefaultAdmin && <div className="text-xs text-slate-400 mt-4 text-center bg-slate-50 rounded-xl px-3 py-2">No login has been set up yet for this shop — finish the one-time Setup Wizard to create your Admin username &amp; password.</div>}
 
               {CLOUD_ENABLED && (
                 <div className="mt-5 pt-4 border-t border-slate-200">
@@ -6670,12 +7042,19 @@ function LoginScreen({ users, setUsers, onLogin, onResetPassword, biz, cloudUser
 
 /* ============================ APP ============================ */
 function App() {
+  /* Developer Mode no longer lives in this file at all — see zahidy-developer-dashboard.html.
+     There is nothing in this component, no password prompt, no tap sequence, no dev-only state,
+     that can unlock license administration from inside a shop's copy of the app. */
   /* Captured BEFORE the businesses state below seeds BIZ_LIST_KEY for the first time, so this
      stays true only on the very first render of a truly fresh browser/profile — exactly the
      moment the Welcome & Setup Wizard should appear. Existing installs (BIZ_LIST_KEY already
      present) never see it, even though they also won't have SETUP_WIZARD_KEY set. */
   const [isFreshInstall] = useState(() => !loadJSON(BIZ_LIST_KEY, null));
   const [wizardCompleted, setWizardCompleted] = useState(() => loadJSON(SETUP_WIZARD_KEY, false));
+  /* Master Cloud Login — see ShopActivationScreen/attemptShopLogin above. No cached account on
+     this device/browser means nothing else below should run yet; the early return further down
+     (after all hooks, to keep Rules of Hooks happy) sends them to ShopActivationScreen first. */
+  const [cloudShopAccount, setCloudShopAccount] = useState(() => loadCloudShopAccount());
   const [businesses, setBusinesses] = useState(() => {
     const list = loadJSON(BIZ_LIST_KEY, null);
     if (list && list.length) return list;
@@ -6758,6 +7137,21 @@ function App() {
   }
   function handleSelfResetPassword(userId, newPassword) { setUsers(prev => prev.map(u => u.id === userId ? { ...u, password: newPassword } : u)); }
   function handleLogout() { recordAuditLog("Logout", "Signed out", currentUser && (currentUser.name || currentUser.username)); localStorage.removeItem(USER_SESSION_KEY); setCurrentUser(null); if (CLOUD_ENABLED && cloudUser) cloudSignOut().catch(() => {}); }
+  /* Disconnect Device — the manual counterpart to the "blocked" auto-signout in the license
+     mirror listener below. Lets the shop owner deliberately unlink THIS device/browser from the
+     Master Shop Account (e.g. before handing the device to someone else, or to re-activate under
+     a different shop username). Clears the cached Master Cloud Login (CLOUD_SHOP_ACCOUNT_KEY) so
+     the next page load falls straight back to ShopActivationScreen — everything else (business
+     data, local staff logins) stays exactly as it is on this device and simply becomes reachable
+     again the moment someone re-activates. Does NOT touch the shop's record in Firestore itself
+     (that stays intact for login from any other device), it only forgets it locally. */
+  function handleDisconnectShopAccount() {
+    if (!confirm("Disconnect this device from the Master Shop Account? You'll need the shop username & password from your service provider to sign back in.")) return;
+    recordAuditLog("Disconnect Device", "Signed out of Master Shop Account", currentUser && (currentUser.name || currentUser.username));
+    clearCloudShopAccount();
+    handleLogout();
+    window.location.reload();
+  }
 
   /* ---- "Continue without Password" (Setup Wizard) / Require Login toggle (Settings ->
      Advanced Customization -> Feature Toggles) ----
@@ -6787,6 +7181,49 @@ function App() {
   useEffect(() => { setData(normalizeData(loadJSON(DATA_KEY(currentBizId), emptyBusinessData()))); }, [currentBizId]);
   useEffect(() => { saveJSON(DATA_KEY(currentBizId), data); }, [data, currentBizId]);
   useEffect(() => { if (!currentUser) return; const allowed = effectiveTabIds(currentUser).filter(id => id === "settings" || uiPrefs.tabs[id] !== false); if (!allowed.includes(activeTab)) setActiveTab((allowed.includes(uiPrefs.defaultTab) ? uiPrefs.defaultTab : allowed[0]) || "dashboard"); }, [currentUser, uiPrefs]);
+  /* Mirrors this shop's OWN activation record down from the shared Firestore registry, so a
+     remote Grant/Revoke made from the separate developer dashboard (which runs on a different
+     machine and has no way to reach into this browser's localStorage) actually takes effect here.
+     Also mirrors Business Type the same way — see cloudRegisterShop's comment above — which is
+     why there's no picker for it anywhere left in this file; this listener (plus the merge-only
+     registration write right before it) is the only code path that ever sets it. Also watches for
+     the account being suspended remotely and signs this device out immediately if so (see Master
+     Cloud Login above) — everything else here is unaffected either way.
+     Keyed by cloudShopId (the developer-assigned username-based id) rather than currentBiz.id
+     directly, so it stays on the exact same document Master Cloud Login authenticated against.
+     Purely a one-way pull for this exact shop — this file still never reads any other shop's
+     data. Re-applying identical data (e.g. right after this device's own cloudPushActivation
+     call echoes back) is a harmless no-op thanks to the equality check, so there's no ping-pong
+     with the push in cloudPushActivation above. */
+  const [licenseTick, setLicenseTick] = useState(0);
+  const shopCloudId = cloudShopId(currentBiz);
+  useEffect(() => {
+    if (!CLOUD_ENABLED || !fbDb || !shopCloudId) return;
+    cloudRegisterShop(shopCloudId, currentBiz && currentBiz.name);
+    const unsub = licenseActivationsCollection().doc(shopCloudId).onSnapshot(doc => {
+      if (!doc.exists) return;
+      const remote = doc.data();
+      if (remote.blocked) {
+        clearCloudShopAccount();
+        handleLogout();
+        window.location.reload();
+        return;
+      }
+      if (remote.businessType && remote.businessType !== loadJSON(CUSTOM_BUSINESS_TYPE_KEY, "mobile_shop")) {
+        saveJSON(CUSTOM_BUSINESS_TYPE_KEY, remote.businessType);
+        window.location.reload(); // so much of the app reads Business Type once via useState initializers
+        return;
+      }
+      const local = loadLicenseState();
+      if (!!remote.isPremium === !!local.isPremium && (remote.expiresAt || null) === (local.expiresAt || null) && (remote.source || null) === (local.source || null)) return;
+      const nextState = remote.isPremium
+        ? { isPremium: true, key: remote.key || local.key || "", activatedAt: remote.activatedAt || local.activatedAt || new Date().toISOString(), expiresAt: remote.expiresAt || null, source: remote.source || "developer_remote" }
+        : { isPremium: false, key: "", activatedAt: null, expiresAt: null, source: remote.source || "developer_remote" };
+      saveLicenseState(nextState);
+      setLicenseTick(t => t + 1);
+    }, err => console.warn("License mirror listener failed:", err.code));
+    return () => unsub();
+  }, [shopCloudId]);
 
   /* ---- online/offline indicator (purely informational — the app works fully offline) ---- */
   const [isOnline, setIsOnline] = useState(navigator.onLine);
@@ -6830,7 +7267,7 @@ function App() {
       case "inventory": return <InventoryTab data={data} setData={setData} role={role} dealers={data.dealers} can={a => canDo("inventory", a)} />;
       case "dealers": return <DealersTab data={data} setData={setData} role={role} can={a => canDo("dealers", a)} />;
       case "purchases": return <PurchasesTab data={data} setData={setData} role={role} can={a => canDo("purchases", a)} />;
-      case "settings": return <SettingsTab businesses={businesses} setBusinesses={setBusinesses} currentBiz={currentBiz} setCurrentBizId={setCurrentBizId} users={users} setUsers={setUsers} currentUser={currentUser} cloudUser={cloudUser} onCloudLogout={handleCloudLogout} cloudStatus={cloudStatus} isOnline={isOnline} onSyncNow={handleSyncNow} data={data} setData={setData} uiPrefs={uiPrefs} setUiPrefs={setUiPrefs} customTheme={customTheme} setCustomTheme={setCustomTheme} />;
+      case "settings": return <SettingsTab businesses={businesses} setBusinesses={setBusinesses} currentBiz={currentBiz} setCurrentBizId={setCurrentBizId} users={users} setUsers={setUsers} currentUser={currentUser} cloudUser={cloudUser} onCloudLogout={handleCloudLogout} cloudStatus={cloudStatus} isOnline={isOnline} onSyncNow={handleSyncNow} data={data} setData={setData} uiPrefs={uiPrefs} setUiPrefs={setUiPrefs} customTheme={customTheme} setCustomTheme={setCustomTheme} cloudShopAccount={cloudShopAccount} onDisconnectShopAccount={handleDisconnectShopAccount} />;
       case "sales": return <SalesTab data={data} setData={setData} role={role} currentUserName={currentUser.name} biz={currentBiz} can={a => canDo("sales", a)} />;
       case "customers": return <CustomersTab data={data} setData={setData} role={role} biz={currentBiz} currentUserName={currentUser.name} can={a => canDo("customers", a)} />;
       case "recovery": return <RecoveryTab data={data} setData={setData} biz={currentBiz} currentUserName={currentUser.name} can={a => canDo("recovery", a)} />;
@@ -6841,6 +7278,22 @@ function App() {
       case "exportdata": return <ExportTab data={data} currentBiz={currentBiz} setData={setData} />;
       default: return null;
     }
+  }
+
+  /* Master Cloud Login — comes before EVERYTHING else, including the Setup Wizard. No shop
+     account cached on this device yet means there's nothing to run the rest of the app against. */
+  if (!cloudShopAccount) {
+    return <ShopActivationScreen onActivated={(acct) => {
+      saveCloudShopAccount(acct);
+      setCloudShopAccount(acct);
+      if (acct.businessType) saveJSON(CUSTOM_BUSINESS_TYPE_KEY, acct.businessType);
+      if (acct.shopName) setBusinesses(prev => prev.map((b, i) => i === 0 ? { ...b, name: acct.shopName, header: acct.shopName } : b));
+      saveLicenseState({
+        isPremium: !!acct.isPremium, key: acct.key || "",
+        activatedAt: acct.isPremium ? (acct.activatedAt || new Date().toISOString()) : null,
+        expiresAt: acct.expiresAt || null, source: acct.source || (acct.isPremium ? "developer_remote" : null),
+      });
+    }} />;
   }
 
   /* First-run Welcome & Setup Wizard — takes over the entire screen (before the Login screen)
@@ -6880,7 +7333,7 @@ function App() {
           ))}
         </nav>
         <div className={"px-5 py-3 border-t border-slate-700 text-xs text-slate-500 " + (compact ? "px-2 text-center" : "")}>
-          {!compact && <>Shop ERP v3.0 &middot; Offline-First</>}
+          {!compact && <span>Shop ERP v3.0 &middot; Offline-First</span>}
           <div className="mt-1"><SyncStatusBadge isOnline={isOnline} cloudStatus={cloudStatus} /></div>
         </div>
       </div>
