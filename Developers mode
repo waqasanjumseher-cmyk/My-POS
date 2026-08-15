@@ -1,0 +1,1357 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Anjum Webs POS — Master Developer Dashboard</title>
+<script src="https://cdn.tailwindcss.com"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.5/babel.min.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-app-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-auth-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore-compat.js"></script>
+<style>
+  body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; }
+  ::-webkit-scrollbar { width: 8px; height: 8px; }
+  ::-webkit-scrollbar-thumb { background: #334155; border-radius: 8px; }
+</style>
+</head>
+<body class="bg-slate-950">
+<div id="root"></div>
+<script type="text/babel" data-presets="react">
+const { useState, useEffect } = React;
+
+/* ============================================================================
+   ANJUM WEBS POS — MASTER DEVELOPER DASHBOARD (standalone, separate from the client app)
+   ----------------------------------------------------------------------------
+   This is a completely separate HTML file from shop-erp-cloud.html — it is never given to a
+   shop/client, so nothing in here is discoverable via that file's view-source, and no client
+   install has a code path, password prompt, or console command that can reach anything below.
+   Keep this file on your own machine only.
+
+   It talks to the SAME shared Firebase project every client build points at by default
+   (FIREBASE_BUILTIN_CONFIG below must match the one in shop-erp-cloud.html). Three Firestore
+   collections under system/license_registry drive everything:
+     - "clients"      the master roster you manage here: credentials, locked Business Type,
+                       plan tier, expiry, block status, per-client feature overrides.
+     - "activations"  the live record a shop's own app reads/writes when it checks in. Every
+                       write you make to a "clients" doc here also mirrors the fields that
+                       matter (isPremium, businessType, businessTypeLocked, blocked, expiresAt,
+                       featureOverrides) into the matching "activations" doc, so changes reach
+                       the shop the next time their app is online — instantly if they have Cloud
+                       Sync connected. A shop can also exist in "activations" without a "clients"
+                       doc if they self-activated a generated key without being onboarded here;
+                       those show up under "Unregistered Activations" so you can adopt them.
+     - "audit_log"    a running record of actions taken from this dashboard (key generated,
+                       client created, plan changed, suspended, etc.) for the Activity Log tab.
+   There is also a top-level "system/feature_flags" document holding the global Free vs. Paid
+   feature switchboard.
+
+   IMPORTANT SCOPE NOTE: this file defines and writes all of the schema above. Whether
+   shop-erp-cloud.html actually reads and enforces businessTypeLocked, blocked, tier, or
+   featureOverrides depends on code in THAT file, which isn't part of this one — the original
+   version of this dashboard already read/wrote isPremium and businessType that way, and the
+   fields added here (blocked, tier, featureOverrides) follow the identical mirror pattern, but
+   the client app needs its own matching read logic for each field to actually act on it.
+
+   Login is a single password, compared only as a SHA-256 hash (never stored/shown in plaintext).
+   CHANGE THE DEFAULT PASSWORD before relying on this — see CHANGING THE PASSWORD below.
+   ============================================================================ */
+
+// ---- Same shared Firebase project the client app (shop-erp-cloud.html) is built against. ----
+const FIREBASE_BUILTIN_CONFIG = {
+  apiKey: "AIzaSyBTQ1niFKVyl9xPyj1Ld4hK3B9nUgrixb8",
+  authDomain: "zahidi-mobiles.firebaseapp.com",
+  projectId: "zahidi-mobiles",
+  storageBucket: "zahidi-mobiles.firebasestorage.app",
+  messagingSenderId: "305729845130",
+  appId: "1:305729845130:web:6dfd1edbff7b2414c53a73",
+};
+const CLOUD_ENABLED = !!(FIREBASE_BUILTIN_CONFIG.apiKey && FIREBASE_BUILTIN_CONFIG.projectId && window.firebase);
+let fbDb = null;
+if (CLOUD_ENABLED) {
+  try {
+    firebase.initializeApp(FIREBASE_BUILTIN_CONFIG);
+    fbDb = firebase.firestore();
+  } catch (e) { console.warn("Firebase failed to initialize:", e); }
+}
+function licenseKeysCollection() { return fbDb.collection("system").doc("license_registry").collection("keys"); }
+function licenseActivationsCollection() { return fbDb.collection("system").doc("license_registry").collection("activations"); }
+function clientsCollection() { return fbDb.collection("system").doc("license_registry").collection("clients"); }
+function auditLogCollection() { return fbDb.collection("system").doc("license_registry").collection("audit_log"); }
+function planRequestsCollection() { return fbDb.collection("system").doc("license_registry").collection("plan_requests"); }
+
+/* ============================ PASSWORD GATE ============================
+   CHANGING THE PASSWORD: open a browser console anywhere, run
+     crypto.subtle.digest("SHA-256", new TextEncoder().encode("yourNewPassword"))
+       .then(b => console.log(Array.from(new Uint8Array(b)).map(x => x.toString(16).padStart(2,"0")).join("")))
+   and paste the printed hex string in as DEFAULT_PASSWORD_HASH below. The plaintext password is
+   never written anywhere in this file. */
+const PASSWORD_HASH_KEY = "zmDevDashboard_passwordHash";
+// SHA-256 of the password "Kwaqas5533$".
+const DEFAULT_PASSWORD_HASH = "aeece52420ac5684c16cf3a4a8894bd95e9b61a7c1ec2c070d3528e7ec4365f5";
+const SESSION_KEY = "zmDevDashboard_unlocked";
+function loadPasswordHash() { try { return localStorage.getItem(PASSWORD_HASH_KEY) || DEFAULT_PASSWORD_HASH; } catch (e) { return DEFAULT_PASSWORD_HASH; } }
+async function sha256Hex(text) {
+  const bytes = new TextEncoder().encode(text || "");
+  const digest = await crypto.subtle.digest("SHA-256", bytes);
+  return Array.from(new Uint8Array(digest)).map(b => b.toString(16).padStart(2, "0")).join("");
+}
+async function verifyPassword(raw) {
+  try { return (await sha256Hex(raw)) === loadPasswordHash(); } catch (e) { return false; }
+}
+function isUnlocked() { try { return sessionStorage.getItem(SESSION_KEY) === "1"; } catch (e) { return false; } }
+function unlockSession() { try { sessionStorage.setItem(SESSION_KEY, "1"); } catch (e) {} }
+function lockSession() { try { sessionStorage.removeItem(SESSION_KEY); } catch (e) {} }
+
+/* ============================ GOOGLE SIGN-IN (alternative to the password) ============================
+   Only the emails listed here can unlock the dashboard this way — anyone else's Google account is
+   signed straight back out, even if Firebase authenticated them, so this can never become an open
+   door. EDIT THIS LIST to the Google account(s) you want to allow, e.g.:
+     const AUTHORIZED_DEV_EMAILS = ["you@gmail.com", "partner@gmail.com"];
+   Also requires turning on the Google sign-in provider once in the Firebase console for this
+   project (Authentication -> Sign-in method -> Google -> Enable) — it's off by default. */
+const AUTHORIZED_DEV_EMAILS = ["waqasanjumseher@gmail.com"];
+const GOOGLE_AUTH_ENABLED = CLOUD_ENABLED && !!(window.firebase && firebase.auth) && AUTHORIZED_DEV_EMAILS.length > 0;
+async function attemptGoogleSignIn() {
+  if (!GOOGLE_AUTH_ENABLED) return { ok: false, error: "Google sign-in isn't set up yet for this dashboard." };
+  try {
+    const provider = new firebase.auth.GoogleAuthProvider();
+    const result = await firebase.auth().signInWithPopup(provider);
+    const email = (result.user && result.user.email || "").toLowerCase();
+    if (!AUTHORIZED_DEV_EMAILS.map(e => e.toLowerCase()).includes(email)) {
+      await firebase.auth().signOut();
+      return { ok: false, error: "That Google account (" + email + ") isn't authorized for this dashboard." };
+    }
+    return { ok: true, email };
+  } catch (err) {
+    if (err.code === "auth/popup-closed-by-user") return { ok: false, error: "" };
+    console.warn("Google sign-in failed:", err.code);
+    return { ok: false, error: "Google sign-in failed. Try again or use your password." };
+  }
+}
+
+/* ============================ LICENSE KEY FORMAT ============================
+   Identical format/checksum to what shop-erp-cloud.html validates, so any key generated here
+   activates correctly in a client's Settings -> License & Subscription screen.
+   ZM-XXXX-XXXX-CCCC, where the first group also self-encodes validity ("P"+3-char base36 day
+   count, or "LIF" for Lifetime) and CCCC is a checksum of the two preceding groups. */
+function licenseChecksumSegment(body) {
+  let sum = 0;
+  for (let i = 0; i < body.length; i++) sum += body.charCodeAt(i) * (i + 1);
+  return sum.toString(36).toUpperCase().padStart(4, "0").slice(-4);
+}
+function encodeDurationCode(days) {
+  if (days == null) return "LIF";
+  return Math.max(0, Math.min(46655, Math.round(days))).toString(36).toUpperCase().padStart(3, "0");
+}
+function generateLicenseKey(days) {
+  const g1 = "P" + encodeDurationCode(days);
+  let g2 = "";
+  while (g2.length < 4) g2 += Math.floor(Math.random() * 36).toString(36);
+  g2 = g2.toUpperCase().slice(0, 4);
+  const g3 = licenseChecksumSegment(g1 + g2);
+  return "ZM-" + g1 + "-" + g2 + "-" + g3;
+}
+
+function uid(prefix) { return (prefix || "id") + "_" + Math.random().toString(36).slice(2, 10) + Date.now().toString(36).slice(-4); }
+function loadJSON(key, fallback) { try { const raw = localStorage.getItem(key); return raw ? JSON.parse(raw) : fallback; } catch (e) { return fallback; } }
+function saveJSON(key, value) { try { localStorage.setItem(key, JSON.stringify(value)); } catch (e) { console.error(e); } }
+function formatDate(iso) { return iso ? new Date(iso).toLocaleDateString() : "\u2014"; }
+function isExpired(expiresAt) { return !!expiresAt && new Date(expiresAt).getTime() <= Date.now(); }
+function capitalize(s) { return s ? s.charAt(0).toUpperCase() + s.slice(1) : s; }
+
+/* ---- Local log of keys generated from this browser (works even if Firestore is briefly
+   unreachable; the cloud registry below is the cross-device source of truth once it syncs). ---- */
+const LOCAL_KEYS_LOG_KEY = "zmDevDashboard_keysLog";
+function loadLocalKeysLog() { return loadJSON(LOCAL_KEYS_LOG_KEY, []); }
+function appendLocalKeysLog(entry) { const log = loadLocalKeysLog(); saveJSON(LOCAL_KEYS_LOG_KEY, [entry, ...log].slice(0, 500)); }
+
+function cloudPushGeneratedKey(key, durationDays, note) {
+  if (!CLOUD_ENABLED || !fbDb) return;
+  licenseKeysCollection().doc(key).set({
+    key, durationDays: durationDays == null ? null : durationDays, note: note || "",
+    generatedAt: firebase.firestore.FieldValue.serverTimestamp(), redeemed: false,
+  }, { merge: true }).catch(err => console.warn("License key registry push failed:", err.code));
+}
+async function cloudFetchActivations() {
+  if (!CLOUD_ENABLED || !fbDb) return [];
+  try {
+    const snap = await licenseActivationsCollection().orderBy("updatedAt", "desc").limit(300).get();
+    return snap.docs.map(d => ({ id: d.id, ...d.data() }));
+  } catch (err) { console.warn("Failed to load activations:", err.code); return []; }
+}
+
+/* ---- Same 10 Business Types shop-erp-cloud.html's CUSTOM_BUSINESS_TYPES defines (ids must match
+   exactly — the client keys its Inventory categories/fields off these ids). Kept as a plain id+label
+   list here since this dashboard doesn't need the full category/field config, only the id to assign. */
+const BUSINESS_TYPES_DEV = [
+  { id: "mobile_shop",       label: "Mobile Shop" },
+  { id: "pharmacy",          label: "Medicine / Pharmacy Store" },
+  { id: "crockery",          label: "Crockery Shop" },
+  { id: "grocery",           label: "Grocery Store" },
+  { id: "general_store",     label: "General Store" },
+  { id: "tiles_ceramics",    label: "Tiles & Ceramics" },
+  { id: "ceiling_paneling",  label: "Ceiling & Paneling" },
+  { id: "hotel",             label: "Hotel" },
+  { id: "fast_food",         label: "Fast Food Chain" },
+  { id: "school_academy",    label: "School / Academy Management" },
+  { id: "other",             label: "Other / General Business" },
+];
+function businessTypeLabel(id) { const t = BUSINESS_TYPES_DEV.find(b => b.id === id); return t ? t.label : "Mobile Shop (default)"; }
+
+const TIER_OPTIONS = [
+  { id: "free",    label: "Free" },
+  { id: "trial",   label: "Trial" },
+  { id: "premium", label: "Premium" },
+];
+const DURATION_OPTIONS = [
+  { id: "7d",  label: "7 Days", days: 7 },
+  { id: "30d", label: "30 Days", days: 30 },
+  { id: "1y",  label: "1 Year", days: 365 },
+  { id: "lifetime", label: "Lifetime", days: null },
+];
+function tierBadge(row) {
+  if (!row.tier || row.tier === "free") return { label: "Free", cls: "bg-slate-800 text-slate-400" };
+  if (isExpired(row.expiresAt)) return { label: capitalize(row.tier) + " (Expired)", cls: "bg-rose-900/60 text-rose-300" };
+  return { label: capitalize(row.tier), cls: row.tier === "premium" ? "bg-emerald-900/60 text-emerald-300" : "bg-sky-900/60 text-sky-300" };
+}
+function statusBadge(row) {
+  return row.blocked ? { label: "Blocked", cls: "bg-rose-900/60 text-rose-300" } : { label: "Active", cls: "bg-emerald-900/60 text-emerald-300" };
+}
+
+function randomPassword(length) {
+  const chars = "ABCDEFGHJKLMNPQRSTUVWXYZabcdefghjkmnpqrstuvwxyz23456789";
+  let out = "";
+  for (let i = 0; i < (length || 10); i++) out += chars[Math.floor(Math.random() * chars.length)];
+  return out;
+}
+function slugify(text) {
+  return (text || "").toLowerCase().trim().replace(/[^a-z0-9]+/g, "").slice(0, 12) || "shop";
+}
+function suggestUsername(shopName) {
+  return slugify(shopName) + Math.floor(100 + Math.random() * 900);
+}
+/* Must stay byte-for-byte identical to normalizeShopUsername() in shop-erp-cloud.html — that's
+   how the client's login screen normalizes what the shop owner types before querying Firestore
+   for a matching "username" field. Applying the exact same normalization here, right before we
+   ever save a username, guarantees the two always agree. Without this, a username saved with a
+   capital letter, a space, or any character outside [a-z0-9_.-] would be stored one way here and
+   searched for a different way there, and login would fail with "No shop account found" even
+   though the account exists. */
+function normalizeShopUsername(u) { return (u || "").trim().toLowerCase().replace(/[^a-z0-9_.-]/g, ""); }
+
+/* ============================ AUDIT LOG ============================
+   Fire-and-forget writes (like cloudPushGeneratedKey above) so a flaky connection never blocks
+   the action that triggered the log entry. Each entry gets a client-generated id used as both
+   the local optimistic-cache key and the Firestore doc id, so a later refresh never duplicates it. */
+const AUDIT_LOG_CACHE_KEY = "zmDevDashboard_auditLogCache";
+function writeAuditLog(action, shopName, detail) {
+  const entry = { id: uid("log"), action, shopName: shopName || "", detail: detail || "", actor: "Developer", timestamp: new Date().toISOString() };
+  saveJSON(AUDIT_LOG_CACHE_KEY, [entry, ...loadJSON(AUDIT_LOG_CACHE_KEY, [])].slice(0, 200));
+  if (CLOUD_ENABLED && fbDb) {
+    auditLogCollection().doc(entry.id).set({
+      action: entry.action, shopName: entry.shopName, detail: entry.detail, actor: entry.actor,
+      timestamp: firebase.firestore.FieldValue.serverTimestamp(),
+    }).catch(err => console.warn("Audit log write failed:", err.code));
+  }
+  return entry;
+}
+async function cloudFetchAuditLog() {
+  if (!CLOUD_ENABLED || !fbDb) return loadJSON(AUDIT_LOG_CACHE_KEY, []);
+  try {
+    const snap = await auditLogCollection().orderBy("timestamp", "desc").limit(100).get();
+    const rows = snap.docs.map(d => {
+      const data = d.data();
+      const ts = data.timestamp && data.timestamp.toDate ? data.timestamp.toDate().toISOString() : (data.timestamp || new Date().toISOString());
+      return { id: d.id, ...data, timestamp: ts };
+    });
+    if (rows.length) saveJSON(AUDIT_LOG_CACHE_KEY, rows);
+    return rows.length ? rows : loadJSON(AUDIT_LOG_CACHE_KEY, []);
+  } catch (err) { console.warn("Failed to load audit log:", err.code); return loadJSON(AUDIT_LOG_CACHE_KEY, []); }
+}
+
+/* ============================ CLIENT MASTER RECORD ============================
+   Every write below updates the "clients" doc (the record you manage here) and mirrors the
+   subset of fields the shop's own app cares about into the matching "activations" doc — see the
+   file-level comment at the top for the exact contract. bizId is stable for a shop's whole
+   lifetime; pass an existing bizId (e.g. when adopting an Unregistered Activation) to attach a
+   managed record to a shop that already exists in "activations". */
+async function mirrorToActivation(bizId, patch) {
+  if (!CLOUD_ENABLED || !fbDb || !bizId) return;
+  try {
+    await licenseActivationsCollection().doc(bizId).set({ bizId, updatedAt: firebase.firestore.FieldValue.serverTimestamp(), ...patch }, { merge: true });
+  } catch (err) { console.warn("Activation mirror failed:", err.code); }
+}
+async function cloudFetchClients() {
+  if (!CLOUD_ENABLED || !fbDb) return [];
+  try {
+    const snap = await clientsCollection().orderBy("createdAt", "desc").limit(500).get();
+    return snap.docs.map(d => ({ id: d.id, ...d.data() }));
+  } catch (err) { console.warn("Failed to load clients:", err.code); return []; }
+}
+async function cloudCreateClient({ bizId, shopName, phone, businessType, username, passwordHash, tier, expiresAt, licenseKey }) {
+  if (!CLOUD_ENABLED || !fbDb) return null;
+  const id = bizId || uid("biz");
+  try {
+    await clientsCollection().doc(id).set({
+      bizId: id, shopName: shopName || "", phone: phone || "", businessType, businessTypeLocked: true,
+      username, passwordHash, tier, blocked: false, expiresAt: expiresAt || null, licenseKey: licenseKey || "",
+      featureOverrides: {}, totalRevenue: 0, createdAt: firebase.firestore.FieldValue.serverTimestamp(), updatedAt: firebase.firestore.FieldValue.serverTimestamp(),
+    }, { merge: true });
+    await mirrorToActivation(id, { bizName: shopName || "", businessType, businessTypeLocked: true, isPremium: tier !== "free", blocked: false, expiresAt: expiresAt || null });
+    writeAuditLog("Client created", shopName, businessTypeLabel(businessType) + " \u00b7 " + capitalize(tier));
+    return id;
+  } catch (err) { console.warn("Client creation failed:", err.code); return null; }
+}
+async function cloudUpdateClientPlan(bizId, shopName, tier, expiresAt) {
+  if (!CLOUD_ENABLED || !fbDb || !bizId) return false;
+  try {
+    await clientsCollection().doc(bizId).set({ tier, expiresAt: expiresAt || null, updatedAt: firebase.firestore.FieldValue.serverTimestamp() }, { merge: true });
+    await mirrorToActivation(bizId, { isPremium: tier !== "free", expiresAt: expiresAt || null });
+    writeAuditLog("Plan changed", shopName, capitalize(tier) + (expiresAt ? " until " + new Date(expiresAt).toLocaleDateString() : (tier === "free" ? "" : " (lifetime)")));
+    return true;
+  } catch (err) { console.warn("Plan update failed:", err.code); return false; }
+}
+/* ============================ PLAN REQUESTS (shop asks, you approve) ============================
+   A shop's own app (shop-erp-cloud.html, Settings -> License & Subscription -> Request a Plan) can
+   write a doc here instead of the shop needing a key handed to them first. Approving one here grants
+   the plan through the exact same cloudUpdateClientPlan path Grant/Revoke already uses, then marks
+   the request resolved so the shop's app (which listens to that one doc) shows the outcome. */
+async function cloudFetchPlanRequests() {
+  if (!CLOUD_ENABLED || !fbDb) return [];
+  try {
+    const snap = await planRequestsCollection().orderBy("requestedAt", "desc").limit(100).get();
+    return snap.docs.map(d => {
+      const data = d.data();
+      const ts = data.requestedAt && data.requestedAt.toDate ? data.requestedAt.toDate().toISOString() : (data.requestedAt || new Date().toISOString());
+      return { id: d.id, ...data, requestedAt: ts };
+    });
+  } catch (err) { console.warn("Failed to load plan requests:", err.code); return []; }
+}
+async function cloudResolvePlanRequest(req, approve, resolvedNote) {
+  if (!CLOUD_ENABLED || !fbDb || !req.id) return false;
+  try {
+    if (approve) {
+      const opt = DURATION_OPTIONS.find(o => o.id === req.requestedDuration);
+      const expiresAt = opt && opt.days != null ? new Date(Date.now() + opt.days * 86400000).toISOString() : null;
+      await cloudUpdateClientPlan(req.bizId, req.bizName, req.requestedTier, expiresAt);
+    }
+    await planRequestsCollection().doc(req.id).set({
+      status: approve ? "approved" : "declined", resolvedNote: resolvedNote || "",
+      resolvedAt: firebase.firestore.FieldValue.serverTimestamp(),
+    }, { merge: true });
+    writeAuditLog(approve ? "Plan request approved" : "Plan request declined", req.bizName, capitalize(req.requestedTier) + (req.requestedDuration ? " \u00b7 " + req.requestedDuration : ""));
+    return true;
+  } catch (err) { console.warn("Plan request resolution failed:", err.code); return false; }
+}
+async function cloudUpdateBusinessType(bizId, shopName, businessType) {
+  if (!CLOUD_ENABLED || !fbDb || !bizId) return false;
+  try {
+    await clientsCollection().doc(bizId).set({ businessType, updatedAt: firebase.firestore.FieldValue.serverTimestamp() }, { merge: true });
+    await mirrorToActivation(bizId, { businessType });
+    writeAuditLog("Business Type changed", shopName, businessTypeLabel(businessType));
+    return true;
+  } catch (err) { console.warn("Business Type update failed:", err.code); return false; }
+}
+async function cloudSetBusinessTypeLock(bizId, shopName, locked) {
+  if (!CLOUD_ENABLED || !fbDb || !bizId) return false;
+  try {
+    await clientsCollection().doc(bizId).set({ businessTypeLocked: locked, updatedAt: firebase.firestore.FieldValue.serverTimestamp() }, { merge: true });
+    await mirrorToActivation(bizId, { businessTypeLocked: locked });
+    writeAuditLog(locked ? "Business Type locked" : "Business Type unlocked", shopName, "");
+    return true;
+  } catch (err) { console.warn("Lock toggle failed:", err.code); return false; }
+}
+async function cloudSetBlocked(bizId, shopName, blocked) {
+  if (!CLOUD_ENABLED || !fbDb || !bizId) return false;
+  try {
+    await clientsCollection().doc(bizId).set({ blocked, updatedAt: firebase.firestore.FieldValue.serverTimestamp() }, { merge: true });
+    await mirrorToActivation(bizId, { blocked });
+    writeAuditLog(blocked ? "Shop suspended" : "Shop activated", shopName, "");
+    return true;
+  } catch (err) { console.warn("Suspend/activate failed:", err.code); return false; }
+}
+async function cloudResetClientPassword(bizId, shopName, passwordHash) {
+  if (!CLOUD_ENABLED || !fbDb || !bizId) return false;
+  try {
+    await clientsCollection().doc(bizId).set({ passwordHash, updatedAt: firebase.firestore.FieldValue.serverTimestamp() }, { merge: true });
+    writeAuditLog("Password reset", shopName, "");
+    return true;
+  } catch (err) { console.warn("Password reset failed:", err.code); return false; }
+}
+/* Repairs a client whose stored "username" doesn't match what the shop's login screen would
+   normalize the same text to (e.g. it was saved before normalizeShopUsername was applied here,
+   or someone typed it with capitals/spaces). Doesn't touch "activations" \u2014 that mirror never
+   carried the username in the first place, so there's nothing to fix there. */
+async function cloudUpdateUsername(bizId, shopName, username) {
+  if (!CLOUD_ENABLED || !fbDb || !bizId) return false;
+  try {
+    await clientsCollection().doc(bizId).set({ username, updatedAt: firebase.firestore.FieldValue.serverTimestamp() }, { merge: true });
+    writeAuditLog("Username updated", shopName, username);
+    return true;
+  } catch (err) { console.warn("Username update failed:", err.code); return false; }
+}
+async function cloudDeleteClient(bizId, shopName) {
+  if (!CLOUD_ENABLED || !fbDb || !bizId) return false;
+  try {
+    await clientsCollection().doc(bizId).delete();
+    await licenseActivationsCollection().doc(bizId).delete().catch(() => {});
+    writeAuditLog("Client deleted", shopName, "");
+    return true;
+  } catch (err) { console.warn("Client delete failed:", err.code); return false; }
+}
+async function cloudSetFeatureOverrides(bizId, shopName, overrides) {
+  if (!CLOUD_ENABLED || !fbDb || !bizId) return false;
+  try {
+    await clientsCollection().doc(bizId).set({ featureOverrides: overrides, updatedAt: firebase.firestore.FieldValue.serverTimestamp() }, { merge: true });
+    await mirrorToActivation(bizId, { featureOverrides: overrides });
+    writeAuditLog("Feature overrides updated", shopName, Object.keys(overrides).length + " override(s)");
+    return true;
+  } catch (err) { console.warn("Feature override update failed:", err.code); return false; }
+}
+/* ---- Manual payment recording. There's no payment gateway connected here \u2014 this just adds
+   to a running Rs total on the client's record, for your own bookkeeping. Doesn't touch
+   "activations" since the shop's own app has no use for its own revenue history. ---- */
+async function cloudRecordPayment(bizId, shopName, amount) {
+  if (!CLOUD_ENABLED || !fbDb || !bizId || !(Number(amount) > 0)) return false;
+  try {
+    await clientsCollection().doc(bizId).set({
+      totalRevenue: firebase.firestore.FieldValue.increment(Number(amount)), updatedAt: firebase.firestore.FieldValue.serverTimestamp(),
+    }, { merge: true });
+    writeAuditLog("Payment recorded", shopName, "Rs " + Number(amount).toLocaleString());
+    return true;
+  } catch (err) { console.warn("Payment record failed:", err.code); return false; }
+}
+
+/* ============================ DYNAMIC FEATURE CONTROL (Free vs Paid, global default) ============
+   A single config document any client build can read: system/feature_flags -> { features:
+   { <id>: { free: bool, paid: bool } } }. Per-client Feature Overrides (in the Edit Client modal)
+   layer on top of this global default for one specific shop, without changing it for everyone
+   else. Cached to localStorage so the panel still shows your last-saved state offline.
+
+   IDs below are kept in exact 1:1 sync with the PREMIUM_FEATURES registry in shop-erp-cloud.html
+   — same ids, so a value written here lines up with the right gate if/when the client is wired
+   to actually read featureOverrides (see the IMPORTANT SCOPE NOTE at the top of this file: as of
+   this writing the client only checks the single account-wide license.isPremium flag — it does
+   NOT yet look at per-feature overrides or this global doc, so toggles below don't take effect on
+   their own yet). "inventoryLimit" (the 50-item Free cap) isn't listed here because it isn't a
+   PremiumGate'd feature client-side — it's just a hardcoded FREE_PLAN_LIMITS number, not something
+   a per-shop on/off override could apply to. */
+const FEATURE_DEFS = [
+  { id: "installments",         label: "Installment Management" },
+  { id: "advancedReports",      label: "Advanced PDF/Excel Reports" },
+  { id: "whatsappImageReceipts",label: "WhatsApp Image Receipts" },
+  { id: "multiAccountProfitLoss", label: "Multi-Account Profit/Loss" },
+  { id: "cloudSync",            label: "Cloud Sync" },
+  { id: "backupRestore",        label: "Backup & Restore" },
+  { id: "importMerge",          label: "Import & Merge" },
+  { id: "businessSettings",     label: "Business Settings (POS, Users, Custom Items, Display, Advanced)" },
+];
+function defaultFeatureFlags() {
+  const out = {};
+  FEATURE_DEFS.forEach(f => { out[f.id] = { free: false, paid: true }; });
+  return out;
+}
+const FEATURE_FLAGS_CACHE_KEY = "zmDevDashboard_featureFlagsCache";
+function loadCachedFeatureFlags() { return loadJSON(FEATURE_FLAGS_CACHE_KEY, null); }
+function saveCachedFeatureFlags(flags) { saveJSON(FEATURE_FLAGS_CACHE_KEY, flags); }
+function featureFlagsDoc() { return fbDb.collection("system").doc("feature_flags"); }
+async function cloudFetchFeatureFlags() {
+  if (!CLOUD_ENABLED || !fbDb) return loadCachedFeatureFlags();
+  try {
+    const snap = await featureFlagsDoc().get();
+    const data = snap.exists ? snap.data().features : null;
+    if (data) saveCachedFeatureFlags(data);
+    return data || loadCachedFeatureFlags();
+  } catch (err) { console.warn("Failed to load feature flags:", err.code); return loadCachedFeatureFlags(); }
+}
+async function cloudSaveFeatureFlags(flags) {
+  saveCachedFeatureFlags(flags);
+  if (!CLOUD_ENABLED || !fbDb) return false;
+  try {
+    await featureFlagsDoc().set({ features: flags, updatedAt: firebase.firestore.FieldValue.serverTimestamp() }, { merge: true });
+    writeAuditLog("Global feature flags updated", "", "");
+    return true;
+  } catch (err) { console.warn("Failed to save feature flags:", err.code); return false; }
+}
+
+/* ============================ REVENUE ESTIMATE SETTING ============================
+   This system has no payment processor wired in — license keys and plan tiers carry no price.
+   The "Estimated Revenue" card on Overview is a simple calculator: the price you set here,
+   multiplied by the number of currently active paid clients. It's a developer-only convenience
+   number stored in this browser only, not a real transaction total. */
+const REVENUE_PRICE_KEY = "zmDevDashboard_revenuePricePerClient";
+function loadRevenuePrice() { const v = loadJSON(REVENUE_PRICE_KEY, 0); return typeof v === "number" ? v : 0; }
+function saveRevenuePrice(v) { saveJSON(REVENUE_PRICE_KEY, v); }
+
+/* ============================ SHARED UI BITS ============================ */
+const inputCls = "w-full border border-slate-700 bg-slate-900 text-slate-100 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-amber-500/50 placeholder:text-slate-600";
+function TextInput(props) { return <input {...props} className={inputCls + " " + (props.className || "")} />; }
+function Field({ label, children }) {
+  return <label className="block mb-3"><span className="block text-xs font-medium text-slate-400 mb-1">{label}</span>{children}</label>;
+}
+function Checkbox({ checked, onChange, disabled }) {
+  return <input type="checkbox" checked={checked} disabled={disabled} onChange={onChange} className="w-4 h-4 accent-amber-500 rounded disabled:opacity-40" />;
+}
+function StatCard({ label, value, sub, children }) {
+  return (
+    <div className="bg-slate-900 border border-slate-800 rounded-xl p-4">
+      <div className="text-[11px] uppercase tracking-wide text-slate-500 mb-1">{label}</div>
+      <div className="text-2xl font-bold text-white leading-tight">{value}</div>
+      {sub && <div className="text-[11px] text-slate-500 mt-1">{sub}</div>}
+      {children}
+    </div>
+  );
+}
+function Modal({ title, onClose, children, wide }) {
+  return (
+    <div className="fixed inset-0 bg-black/60 flex items-start sm:items-center justify-center p-4 z-50 overflow-y-auto" onClick={onClose}>
+      <div onClick={e => e.stopPropagation()} className={"bg-slate-900 border border-slate-800 rounded-2xl p-5 my-8 w-full " + (wide ? "max-w-2xl" : "max-w-md")}>
+        <div className="flex items-center justify-between mb-4">
+          <h3 className="text-sm font-semibold text-white">{title}</h3>
+          <button onClick={onClose} className="text-slate-500 hover:text-slate-300 text-lg leading-none">&times;</button>
+        </div>
+        {children}
+      </div>
+    </div>
+  );
+}
+
+/* ============================ CHANGE PASSWORD MODAL ============================
+   Saves the new hash to localStorage (PASSWORD_HASH_KEY), which loadPasswordHash() already
+   prefers over DEFAULT_PASSWORD_HASH — so this is the in-app equivalent of the manual
+   console+file-edit method described in the header comment above, no code editing needed. */
+function ChangePasswordModal({ onClose }) {
+  const [current, setCurrent] = useState("");
+  const [next, setNext] = useState("");
+  const [confirmNext, setConfirmNext] = useState("");
+  const [error, setError] = useState("");
+  const [saving, setSaving] = useState(false);
+  const [done, setDone] = useState(false);
+  async function submit() {
+    setError("");
+    if (!(await verifyPassword(current))) { setError("Current password is incorrect."); return; }
+    if (next.length < 8) { setError("New password must be at least 8 characters."); return; }
+    if (next !== confirmNext) { setError("New password and confirmation don't match."); return; }
+    setSaving(true);
+    const hash = await sha256Hex(next);
+    try { localStorage.setItem(PASSWORD_HASH_KEY, hash); } catch (e) {}
+    setSaving(false);
+    setDone(true);
+  }
+  return (
+    <Modal title="Change Password" onClose={onClose}>
+      {done ? (
+        <div className="space-y-3">
+          <div className="text-sm text-emerald-400">Password updated. Use it next time you unlock this dashboard.</div>
+          <button onClick={onClose} className="w-full bg-amber-500 hover:bg-amber-400 text-slate-900 text-sm font-semibold px-4 py-2.5 rounded-lg">Done</button>
+        </div>
+      ) : (
+        <div className="space-y-3">
+          <Field label="Current Password"><TextInput type="password" autoFocus value={current} onChange={e => { setCurrent(e.target.value); setError(""); }} /></Field>
+          <Field label="New Password"><TextInput type="password" value={next} onChange={e => { setNext(e.target.value); setError(""); }} /></Field>
+          <Field label="Confirm New Password"><TextInput type="password" value={confirmNext} onChange={e => { setConfirmNext(e.target.value); setError(""); }} /></Field>
+          {error && <div className="text-xs text-rose-400">{error}</div>}
+          <button disabled={saving || !current || !next || !confirmNext} onClick={submit} className="w-full bg-amber-500 hover:bg-amber-400 disabled:opacity-50 text-slate-900 text-sm font-semibold px-4 py-2.5 rounded-lg">{saving ? "Saving\u2026" : "Save New Password"}</button>
+        </div>
+      )}
+    </Modal>
+  );
+}
+
+/* ============================ LOGIN GATE ============================ */
+function PasswordGate({ onUnlock }) {
+  const [password, setPassword] = useState("");
+  const [error, setError] = useState("");
+  const [checking, setChecking] = useState(false);
+  const [googleBusy, setGoogleBusy] = useState(false);
+  async function submit(e) {
+    e.preventDefault();
+    setChecking(true);
+    const ok = await verifyPassword(password);
+    setChecking(false);
+    if (!ok) { setError("Incorrect password."); return; }
+    unlockSession();
+    onUnlock();
+  }
+  async function submitGoogle() {
+    setError("");
+    setGoogleBusy(true);
+    const result = await attemptGoogleSignIn();
+    setGoogleBusy(false);
+    if (!result.ok) { if (result.error) setError(result.error); return; }
+    unlockSession();
+    onUnlock();
+  }
+  return (
+    <div className="min-h-screen flex items-center justify-center bg-slate-950 px-4">
+      <form onSubmit={submit} className="w-full max-w-sm bg-slate-900 border border-slate-800 rounded-2xl p-6">
+        <div className="w-11 h-11 rounded-xl bg-gradient-to-br from-amber-400 to-amber-600 flex items-center justify-center text-xl mb-3">{"\u{1F6E0}\uFE0F"}</div>
+        <h1 className="text-white font-bold text-lg mb-1">Anjum Webs POS</h1>
+        <p className="text-slate-400 text-sm mb-4">Developer Dashboard — enter your password to continue.</p>
+        <TextInput type="password" autoFocus placeholder="Password" value={password} onChange={e => { setPassword(e.target.value); setError(""); }} />
+        {error && <div className="text-xs text-rose-400 mt-2">{error}</div>}
+        <button type="submit" disabled={checking || !password} className="w-full mt-4 bg-amber-500 hover:bg-amber-400 disabled:opacity-50 text-slate-900 text-sm font-semibold px-4 py-2.5 rounded-lg transition">{checking ? "Checking\u2026" : "Unlock"}</button>
+        {GOOGLE_AUTH_ENABLED && (
+          <>
+            <div className="flex items-center gap-2 my-4"><div className="flex-1 h-px bg-slate-800" /><span className="text-[11px] text-slate-500">OR</span><div className="flex-1 h-px bg-slate-800" /></div>
+            <button type="button" disabled={googleBusy} onClick={submitGoogle} className="w-full flex items-center justify-center gap-2 bg-slate-800 hover:bg-slate-700 disabled:opacity-50 text-slate-200 text-sm font-medium px-4 py-2.5 rounded-lg transition">
+              <span>{"\u{1F510}"}</span>{googleBusy ? "Signing in\u2026" : "Sign in with Google"}
+            </button>
+          </>
+        )}
+      </form>
+    </div>
+  );
+}
+
+/* ============================ ADD CLIENT MODAL ============================ */
+function AddClientModal({ onClose, onCreated, prefill }) {
+  const [shopName, setShopName] = useState((prefill && prefill.shopName) || "");
+  const [phone, setPhone] = useState("");
+  const [businessType, setBusinessType] = useState((prefill && prefill.businessType) || "mobile_shop");
+  const [username, setUsername] = useState("");
+  const [password, setPassword] = useState(() => randomPassword());
+  const [tier, setTier] = useState((prefill && prefill.tier) || "free");
+  const [duration, setDuration] = useState("30d");
+  const [saving, setSaving] = useState(false);
+  const [result, setResult] = useState(null);
+  const [copiedField, setCopiedField] = useState("");
+
+  useEffect(() => { if (shopName && !username) setUsername(suggestUsername(shopName)); }, [shopName]); // eslint-disable-line
+  const normalizedUsername = normalizeShopUsername(username);
+
+  function copyText(field, text) {
+    if (navigator.clipboard && navigator.clipboard.writeText) navigator.clipboard.writeText(text).catch(() => {});
+    setCopiedField(field);
+    setTimeout(() => setCopiedField(""), 1500);
+  }
+
+  async function submit() {
+    const name = shopName.trim();
+    const user = normalizeShopUsername(username) || normalizeShopUsername(suggestUsername(name));
+    if (!name || !user || !password) return;
+    setSaving(true);
+    let expiresAt = null;
+    let licenseKey = "";
+    if (tier !== "free") {
+      const opt = DURATION_OPTIONS.find(o => o.id === duration) || DURATION_OPTIONS[1];
+      expiresAt = opt.days == null ? null : new Date(Date.now() + opt.days * 86400000).toISOString();
+      licenseKey = generateLicenseKey(opt.days);
+      cloudPushGeneratedKey(licenseKey, opt.days, name + " (issued at client creation)");
+    }
+    const passwordHash = await sha256Hex(password);
+    const bizId = await cloudCreateClient({ bizId: prefill && prefill.bizId, shopName: name, phone, businessType, username: user, passwordHash, tier, expiresAt, licenseKey });
+    setSaving(false);
+    if (!bizId) { alert("Couldn't create the client — check the connection notice above."); return; }
+    setResult({ shopName: name, username: user, password, licenseKey });
+  }
+
+  function finish() { onCreated(); onClose(); }
+
+  return (
+    <Modal title={prefill ? "Add as Managed Client" : "Add New Client"} onClose={result ? finish : onClose} wide>
+      {result ? (
+        <div className="bg-emerald-950/40 border border-emerald-800 rounded-lg p-3 text-xs space-y-1.5">
+          <div className="text-emerald-300 font-medium mb-1">{result.shopName} was created</div>
+          <div className="flex items-center justify-between gap-3"><span className="text-slate-300">Username: <span className="font-mono text-emerald-200">{result.username}</span></span><button onClick={() => copyText("u", result.username)} className="px-2 py-1 rounded bg-emerald-800 hover:bg-emerald-700 text-emerald-100">{copiedField === "u" ? "Copied!" : "Copy"}</button></div>
+          <div className="flex items-center justify-between gap-3"><span className="text-slate-300">Password: <span className="font-mono text-emerald-200">{result.password}</span></span><button onClick={() => copyText("p", result.password)} className="px-2 py-1 rounded bg-emerald-800 hover:bg-emerald-700 text-emerald-100">{copiedField === "p" ? "Copied!" : "Copy"}</button></div>
+          {result.licenseKey && <div className="flex items-center justify-between gap-3"><span className="text-slate-300">License Key: <span className="font-mono text-emerald-200">{result.licenseKey}</span></span><button onClick={() => copyText("k", result.licenseKey)} className="px-2 py-1 rounded bg-emerald-800 hover:bg-emerald-700 text-emerald-100">{copiedField === "k" ? "Copied!" : "Copy"}</button></div>}
+          <div className="text-emerald-500/80 pt-1">Shown once \u2014 only the password's hash is stored. Save these before closing.</div>
+          <button onClick={finish} className="mt-2 w-full bg-emerald-700 hover:bg-emerald-600 text-emerald-50 text-sm font-semibold px-4 py-2 rounded-lg">Done</button>
+        </div>
+      ) : (
+        <div>
+          <div className="grid sm:grid-cols-2 gap-x-4">
+            <Field label="Shop / Client Name"><TextInput value={shopName} onChange={e => setShopName(e.target.value)} placeholder="e.g. Ali Traders, Lahore" /></Field>
+            <Field label="Contact / Phone"><TextInput value={phone} onChange={e => setPhone(e.target.value)} placeholder="03xx-xxxxxxx" /></Field>
+            <Field label="Business Type (locked at creation)">
+              <select value={businessType} onChange={e => setBusinessType(e.target.value)} className={inputCls}>
+                {BUSINESS_TYPES_DEV.map(t => <option key={t.id} value={t.id}>{t.label}</option>)}
+              </select>
+            </Field>
+            <Field label="Owner Username">
+              <TextInput value={username} onChange={e => setUsername(e.target.value)} placeholder="auto-suggested from shop name" />
+              <div className="text-[11px] text-slate-500 mt-1">{normalizedUsername ? <span>Will be saved as <span className="font-mono text-slate-300">{normalizedUsername}</span> \u2014 this is what the shop owner must type to log in.</span> : <span className="text-rose-400">Enter at least one letter or number.</span>}</div>
+            </Field>
+            <Field label="Password">
+              <div className="flex gap-2">
+                <TextInput value={password} onChange={e => setPassword(e.target.value)} />
+                <button type="button" onClick={() => setPassword(randomPassword())} className="text-xs px-3 rounded-lg border border-slate-700 text-slate-300 hover:bg-slate-800 whitespace-nowrap">Regenerate</button>
+              </div>
+            </Field>
+            <Field label="Initial License Tier">
+              <div className="flex flex-wrap gap-2">
+                {TIER_OPTIONS.map(o => (
+                  <button key={o.id} type="button" onClick={() => setTier(o.id)} className={"text-xs font-medium px-3 py-2 rounded-lg border " + (tier === o.id ? "bg-amber-500 border-amber-500 text-slate-900" : "border-slate-700 text-slate-300 hover:bg-slate-800")}>{o.label}</button>
+                ))}
+              </div>
+            </Field>
+          </div>
+          {tier !== "free" && (
+            <Field label="Expiry Duration">
+              <div className="flex flex-wrap gap-2">
+                {DURATION_OPTIONS.map(o => (
+                  <button key={o.id} type="button" onClick={() => setDuration(o.id)} className={"text-xs font-medium px-3 py-2 rounded-lg border " + (duration === o.id ? "bg-amber-500 border-amber-500 text-slate-900" : "border-slate-700 text-slate-300 hover:bg-slate-800")}>{o.label}</button>
+                ))}
+              </div>
+              <div className="text-[11px] text-slate-500 mt-1">A matching license key is generated automatically for Trial/Premium plans.</div>
+            </Field>
+          )}
+          <button disabled={saving || !shopName.trim() || !normalizedUsername || !password} onClick={submit} className="mt-2 bg-amber-500 hover:bg-amber-400 disabled:opacity-50 text-slate-900 text-sm font-semibold px-4 py-2.5 rounded-lg">{saving ? "Creating\u2026" : "Create Client"}</button>
+        </div>
+      )}
+    </Modal>
+  );
+}
+
+/* ============================ EDIT CLIENT MODAL ============================ */
+function EditClientModal({ row, onClose, onSaved, featureFlags }) {
+  const [businessType, setBusinessType] = useState(row.businessType || "mobile_shop");
+  const [bizTypeUnlocked, setBizTypeUnlocked] = useState(false);
+  const [tier, setTier] = useState(row.tier || "free");
+  const [duration, setDuration] = useState("30d");
+  const [saving, setSaving] = useState(false);
+  const [resetPw, setResetPw] = useState(null);
+  const [resettingPw, setResettingPw] = useState(false);
+  const [overrides, setOverrides] = useState(row.featureOverrides || {});
+  const [username, setUsername] = useState(row.username || "");
+  const [savingUsername, setSavingUsername] = useState(false);
+  const [usernameNotice, setUsernameNotice] = useState("");
+  const normalizedUsername = normalizeShopUsername(username);
+  const usernameMismatch = row.username && row.username !== normalizeShopUsername(row.username);
+
+  async function doSaveUsername() {
+    if (!normalizedUsername) return;
+    setSavingUsername(true);
+    const ok = await cloudUpdateUsername(row.bizId, row.shopName, normalizedUsername);
+    setSavingUsername(false);
+    if (ok) { setUsername(normalizedUsername); setUsernameNotice("Saved \u2014 the shop can now log in with this exact username."); onSaved(); }
+  }
+  const [paymentAmount, setPaymentAmount] = useState("");
+  const [recordingPayment, setRecordingPayment] = useState(false);
+  const [recordedTotal, setRecordedTotal] = useState(Number(row.totalRevenue) || 0);
+  const [paymentNotice, setPaymentNotice] = useState("");
+
+  async function doRecordPayment() {
+    setRecordingPayment(true);
+    const ok = await cloudRecordPayment(row.bizId, row.shopName, paymentAmount);
+    setRecordingPayment(false);
+    if (ok) {
+      setRecordedTotal(prev => prev + (Number(paymentAmount) || 0));
+      setPaymentAmount("");
+      setPaymentNotice("Payment recorded.");
+      onSaved();
+    }
+  }
+
+  function overrideValue(id) { return overrides[id] === true ? "on" : overrides[id] === false ? "off" : "default"; }
+  function setOverride(id, val) {
+    setOverrides(prev => {
+      const next = { ...prev };
+      if (val === "default") delete next[id]; else next[id] = val === "on";
+      return next;
+    });
+  }
+
+  async function doResetPassword() {
+    if (!confirm("Generate a new password for " + row.shopName + "? The old one stops working immediately.")) return;
+    const pw = randomPassword();
+    setResettingPw(true);
+    const ok = await cloudResetClientPassword(row.bizId, row.shopName, await sha256Hex(pw));
+    setResettingPw(false);
+    if (ok) setResetPw(pw);
+  }
+
+  async function save() {
+    setSaving(true);
+    if (businessType !== row.businessType) await cloudUpdateBusinessType(row.bizId, row.shopName, businessType);
+    let expiresAt = row.expiresAt || null;
+    if (tier !== row.tier) {
+      if (tier === "free") { expiresAt = null; }
+      else { const opt = DURATION_OPTIONS.find(o => o.id === duration) || DURATION_OPTIONS[1]; expiresAt = opt.days == null ? null : new Date(Date.now() + opt.days * 86400000).toISOString(); }
+      await cloudUpdateClientPlan(row.bizId, row.shopName, tier, expiresAt);
+    }
+    if (JSON.stringify(overrides) !== JSON.stringify(row.featureOverrides || {})) await cloudSetFeatureOverrides(row.bizId, row.shopName, overrides);
+    setSaving(false);
+    onSaved();
+    onClose();
+  }
+
+  return (
+    <Modal title={"Edit \u2014 " + (row.shopName || row.bizId)} onClose={onClose} wide>
+      <div className="space-y-5">
+        <div>
+          <div className="text-xs font-medium text-slate-400 mb-1">Owner Username <span className="text-slate-600 font-normal">(what the shop types on their login screen)</span></div>
+          {usernameMismatch && !usernameNotice && (
+            <div className="text-[11px] text-amber-400 bg-amber-950/40 border border-amber-800 rounded-lg px-2.5 py-1.5 mb-1.5">This client's saved username won't match what their login screen searches for \u2014 login will fail with "No shop account found" until you save the corrected version below.</div>
+          )}
+          <div className="flex gap-2">
+            <TextInput value={username} onChange={e => { setUsername(e.target.value); setUsernameNotice(""); }} className="flex-1" />
+            <button type="button" disabled={savingUsername || !normalizedUsername || normalizedUsername === row.username} onClick={doSaveUsername} className="text-xs px-3 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-200 disabled:opacity-50 whitespace-nowrap">{savingUsername ? "Saving\u2026" : "Save"}</button>
+          </div>
+          {usernameNotice ? (
+            <div className="text-[11px] text-emerald-400 mt-1">{usernameNotice}</div>
+          ) : (
+            <div className="text-[11px] text-slate-500 mt-1">Will be saved as <span className="font-mono text-slate-300">{normalizedUsername || "\u2014"}</span>.</div>
+          )}
+        </div>
+
+        <div>
+          <div className="text-xs font-medium text-slate-400 mb-1">Business Type</div>
+          <div className="flex items-center gap-2">
+            <select value={businessType} disabled={!bizTypeUnlocked} onChange={e => setBusinessType(e.target.value)} className={inputCls + " disabled:opacity-50"}>
+              {BUSINESS_TYPES_DEV.map(t => <option key={t.id} value={t.id}>{t.label}</option>)}
+            </select>
+            <button type="button" onClick={() => { if (bizTypeUnlocked || confirm("Unlock Business Type for editing? Lock it again once you're done.")) setBizTypeUnlocked(v => !v); }} title={bizTypeUnlocked ? "Unlocked \u2014 click to lock" : "Locked \u2014 click to unlock"} className={"text-xs px-2.5 py-2 rounded-lg border whitespace-nowrap " + (bizTypeUnlocked ? "border-slate-700 text-slate-400 hover:bg-slate-800" : "border-amber-700 text-amber-400 bg-amber-950/40")}>
+              {bizTypeUnlocked ? "\u{1F513} Unlocked" : "\u{1F512} Locked"}
+            </button>
+          </div>
+        </div>
+
+        <div>
+          <div className="text-xs font-medium text-slate-400 mb-1">License Tier</div>
+          <div className="flex flex-wrap gap-2 mb-2">
+            {TIER_OPTIONS.map(o => (
+              <button key={o.id} type="button" onClick={() => setTier(o.id)} className={"text-xs font-medium px-3 py-2 rounded-lg border " + (tier === o.id ? "bg-amber-500 border-amber-500 text-slate-900" : "border-slate-700 text-slate-300 hover:bg-slate-800")}>{o.label}</button>
+            ))}
+          </div>
+          {tier !== "free" && tier !== row.tier && (
+            <div className="flex flex-wrap gap-2">
+              {DURATION_OPTIONS.map(o => (
+                <button key={o.id} type="button" onClick={() => setDuration(o.id)} className={"text-xs font-medium px-3 py-2 rounded-lg border " + (duration === o.id ? "bg-amber-500 border-amber-500 text-slate-900" : "border-slate-700 text-slate-300 hover:bg-slate-800")}>{o.label}</button>
+              ))}
+            </div>
+          )}
+          {tier !== "free" && tier === row.tier && <div className="text-[11px] text-slate-500">Current expiry: {formatDate(row.expiresAt)} {"\u2014"} change tier away and back to reset the duration.</div>}
+        </div>
+
+        <div>
+          <div className="text-xs font-medium text-slate-400 mb-1">Password</div>
+          {resetPw ? (
+            <div className="bg-emerald-950/40 border border-emerald-800 rounded-lg p-2.5 text-xs flex items-center justify-between gap-3">
+              <span className="text-slate-300">New password: <span className="font-mono text-emerald-200">{resetPw}</span></span>
+              <span className="text-emerald-500/80">Shown once</span>
+            </div>
+          ) : (
+            <button type="button" disabled={resettingPw} onClick={doResetPassword} className="text-xs px-3 py-2 rounded-lg border border-slate-700 text-slate-300 hover:bg-slate-800 disabled:opacity-50">{resettingPw ? "Resetting\u2026" : "Reset Password"}</button>
+          )}
+        </div>
+
+        <div>
+          <div className="text-xs font-medium text-slate-400 mb-1">Record a Payment</div>
+          <p className="text-[11px] text-slate-500 mb-2">Total recorded so far: Rs {recordedTotal.toLocaleString()}. Manual \u2014 there's no payment gateway connected.</p>
+          {paymentNotice && <div className="text-[11px] text-emerald-400 mb-2">{paymentNotice}</div>}
+          <div className="flex gap-2">
+            <TextInput type="number" min="0" value={paymentAmount} onChange={e => { setPaymentAmount(e.target.value); setPaymentNotice(""); }} placeholder="Amount (Rs)" className="flex-1" />
+            <button type="button" disabled={recordingPayment || !(Number(paymentAmount) > 0)} onClick={doRecordPayment} className="text-xs px-3 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-200 disabled:opacity-50 whitespace-nowrap">{recordingPayment ? "Saving\u2026" : "Record"}</button>
+          </div>
+        </div>
+
+        <div>
+          <div className="text-xs font-medium text-slate-400 mb-2">Feature Overrides <span className="text-slate-600 font-normal">(for this shop only \u2014 otherwise follows the global Feature Control setting)</span></div>
+          <div className="max-h-56 overflow-y-auto pr-1 space-y-1.5">
+            {FEATURE_DEFS.map(f => (
+              <div key={f.id} className="flex items-center justify-between text-xs bg-slate-800/50 rounded-lg px-3 py-2">
+                <span className="text-slate-300">{f.label}</span>
+                <select value={overrideValue(f.id)} onChange={e => setOverride(f.id, e.target.value)} className="text-[11px] border border-slate-700 bg-slate-900 text-slate-200 rounded-lg px-2 py-1 focus:outline-none focus:ring-2 focus:ring-amber-500/50">
+                  <option value="default">Default ({featureFlags[f.id] && featureFlags[f.id][row.tier === "free" ? "free" : "paid"] ? "On" : "Off"})</option>
+                  <option value="on">Force On</option>
+                  <option value="off">Force Off</option>
+                </select>
+              </div>
+            ))}
+          </div>
+        </div>
+
+        <button disabled={saving} onClick={save} className="w-full bg-amber-500 hover:bg-amber-400 disabled:opacity-50 text-slate-900 text-sm font-semibold px-4 py-2.5 rounded-lg">{saving ? "Saving\u2026" : "Save Changes"}</button>
+      </div>
+    </Modal>
+  );
+}
+
+/* ============================ DASHBOARD ============================ */
+function Dashboard({ onLock }) {
+  const [tab, setTab] = useState("overview"); // overview | clients | features | keys | logs
+
+  /* ---- Clients (master roster) + Unregistered Activations ---- */
+  const [clients, setClients] = useState([]);
+  const [activations, setActivations] = useState([]);
+  const [loadingClients, setLoadingClients] = useState(false);
+  const [busyBizId, setBusyBizId] = useState("");
+  const [showAddModal, setShowAddModal] = useState(false);
+  const [addPrefill, setAddPrefill] = useState(null);
+  const [editRow, setEditRow] = useState(null);
+  const [showChangePassword, setShowChangePassword] = useState(false);
+
+  async function refreshClients() {
+    setLoadingClients(true);
+    const [c, a] = await Promise.all([cloudFetchClients(), cloudFetchActivations()]);
+    setClients(c);
+    setActivations(a);
+    setLoadingClients(false);
+  }
+  useEffect(() => { if (CLOUD_ENABLED && (tab === "overview" || tab === "clients")) refreshClients(); }, [tab]);
+
+  const clientBizIds = new Set(clients.map(c => c.bizId));
+  const unregistered = activations.filter(a => a.bizId && !clientBizIds.has(a.bizId));
+
+  async function suspendToggle(row) {
+    const next = !row.blocked;
+    if (next && !confirm("Suspend " + (row.shopName || row.bizId) + "? Their shop app will lose access.")) return;
+    setBusyBizId(row.bizId);
+    await cloudSetBlocked(row.bizId, row.shopName, next);
+    await refreshClients();
+    setBusyBizId("");
+  }
+  async function deleteRow(row) {
+    if (!confirm("Delete the client record for " + (row.shopName || row.bizId) + "? This removes their login credentials and plan info. This can't be undone.")) return;
+    setBusyBizId(row.bizId);
+    await cloudDeleteClient(row.bizId, row.shopName);
+    await refreshClients();
+    setBusyBizId("");
+  }
+  function openAdd() { setAddPrefill(null); setShowAddModal(true); }
+  function openAdopt(row) { setAddPrefill({ bizId: row.bizId, shopName: row.bizName, businessType: row.businessType, tier: row.isPremium ? "premium" : "free" }); setShowAddModal(true); }
+
+  /* ---- Dynamic Feature Control (global Free vs Paid) ---- */
+  const [featureFlags, setFeatureFlags] = useState(() => loadCachedFeatureFlags() || defaultFeatureFlags());
+  const [loadingFeatures, setLoadingFeatures] = useState(false);
+  const [savingFeatures, setSavingFeatures] = useState(false);
+  const [featuresSaved, setFeaturesSaved] = useState(false);
+  const [featuresDirty, setFeaturesDirty] = useState(false);
+  async function refreshFeatureFlags() {
+    setLoadingFeatures(true);
+    const flags = await cloudFetchFeatureFlags();
+    setFeatureFlags({ ...defaultFeatureFlags(), ...(flags || {}) });
+    setLoadingFeatures(false);
+    setFeaturesDirty(false);
+  }
+  useEffect(() => { if (tab === "features") refreshFeatureFlags(); }, [tab]);
+  function toggleFeature(id, plan) {
+    setFeatureFlags(prev => ({ ...prev, [id]: { ...prev[id], [plan]: !prev[id][plan] } }));
+    setFeaturesDirty(true);
+    setFeaturesSaved(false);
+  }
+  async function doSaveFeatureFlags() {
+    setSavingFeatures(true);
+    const ok = await cloudSaveFeatureFlags(featureFlags);
+    setSavingFeatures(false);
+    setFeaturesDirty(false);
+    setFeaturesSaved(ok);
+    if (ok) setTimeout(() => setFeaturesSaved(false), 2000);
+  }
+
+  /* ---- Generate License Keys (still useful standalone, e.g. for Cloud-Sync-disabled shops) ---- */
+  const VALIDITY_OPTIONS = [
+    { id: "30d", label: "30 Days", days: 30 },
+    { id: "1y", label: "1 Year", days: 365 },
+    { id: "lifetime", label: "Lifetime", days: null },
+  ];
+  const [validity, setValidity] = useState("lifetime");
+  const [note, setNote] = useState("");
+  const [justGenerated, setJustGenerated] = useState(null);
+  const [keysLog, setKeysLog] = useState(() => loadLocalKeysLog());
+  const [copiedKey, setCopiedKey] = useState("");
+  function doGenerate() {
+    const opt = VALIDITY_OPTIONS.find(o => o.id === validity) || VALIDITY_OPTIONS[2];
+    const key = generateLicenseKey(opt.days);
+    const entry = { key, days: opt.days, label: opt.label, note: note.trim(), generatedAt: new Date().toISOString() };
+    appendLocalKeysLog(entry);
+    setKeysLog(loadLocalKeysLog());
+    setJustGenerated(entry);
+    cloudPushGeneratedKey(key, opt.days, note.trim());
+    writeAuditLog("License key generated", note.trim(), opt.label);
+    setNote("");
+  }
+  function copyKey(key) {
+    if (navigator.clipboard && navigator.clipboard.writeText) navigator.clipboard.writeText(key).catch(() => {});
+    setCopiedKey(key);
+    setTimeout(() => setCopiedKey(""), 1500);
+  }
+
+  /* ---- Activity Log ---- */
+  const [auditLog, setAuditLog] = useState(() => loadJSON(AUDIT_LOG_CACHE_KEY, []));
+  const [loadingLog, setLoadingLog] = useState(false);
+  async function refreshAuditLog() {
+    setLoadingLog(true);
+    setAuditLog(await cloudFetchAuditLog());
+    setLoadingLog(false);
+  }
+  useEffect(() => { if (tab === "logs") refreshAuditLog(); }, [tab]);
+
+  /* ---- Plan Requests (shops asking for Trial/Premium) ---- */
+  const [planRequests, setPlanRequests] = useState([]);
+  const [loadingRequests, setLoadingRequests] = useState(false);
+  const [busyRequestId, setBusyRequestId] = useState("");
+  async function refreshPlanRequests() {
+    setLoadingRequests(true);
+    setPlanRequests(await cloudFetchPlanRequests());
+    setLoadingRequests(false);
+  }
+  useEffect(() => { if (CLOUD_ENABLED && (tab === "overview" || tab === "requests")) refreshPlanRequests(); }, [tab]);
+  const pendingRequests = planRequests.filter(r => r.status === "pending");
+  async function resolveRequest(req, approve) {
+    if (approve && !confirm("Approve " + capitalize(req.requestedTier) + " for " + (req.bizName || req.bizId) + "?")) return;
+    if (!approve && !confirm("Decline this request from " + (req.bizName || req.bizId) + "?")) return;
+    setBusyRequestId(req.id);
+    const ok = await cloudResolvePlanRequest(req, approve, "");
+    setBusyRequestId("");
+    if (ok) { refreshPlanRequests(); if (approve) refreshClients(); }
+  }
+
+  /* ---- Overview stats ---- */
+  const allShops = [
+    ...clients,
+    ...unregistered.map(a => ({ bizId: a.bizId, shopName: a.bizName || a.bizId, tier: a.isPremium ? "premium" : "free", blocked: !!a.blocked, expiresAt: a.expiresAt || null })),
+  ];
+  const totalShops = allShops.length;
+  const blockedCount = allShops.filter(r => r.blocked).length;
+  const premiumCount = allShops.filter(r => r.tier && r.tier !== "free" && !isExpired(r.expiresAt)).length;
+  const freeCount = totalShops - premiumCount;
+  const [revenuePrice, setRevenuePrice] = useState(() => loadRevenuePrice());
+  function updateRevenuePrice(v) { const n = Number(v) || 0; setRevenuePrice(n); saveRevenuePrice(n); }
+  const recordedRevenue = clients.reduce((s, c) => s + (Number(c.totalRevenue) || 0), 0);
+
+  const TABS_DEV = [
+    { id: "overview", label: "Overview", icon: "\u{1F4CA}" },
+    { id: "clients", label: "Clients & Shops", icon: "\u{1F3EA}" },
+    { id: "requests", label: "Plan Requests", icon: "\u{1F4E5}" },
+    { id: "features", label: "Feature Control", icon: "\u{1F39B}\uFE0F" },
+    { id: "keys", label: "Generate Keys", icon: "\u{1F511}" },
+    { id: "logs", label: "Activity Log", icon: "\u{1F4DC}" },
+  ];
+
+  return (
+    <div className="min-h-screen bg-slate-950 text-slate-200">
+      <div className="border-b border-slate-800 bg-slate-900/60 px-4 md:px-8 py-4 flex items-center justify-between flex-wrap gap-3">
+        <div className="flex items-center gap-3">
+          <div className="w-9 h-9 rounded-lg bg-gradient-to-br from-amber-400 to-amber-600 flex items-center justify-center text-lg">{"\u{1F6E0}\uFE0F"}</div>
+          <div>
+            <div className="text-sm font-bold text-white leading-tight">Anjum Webs POS</div>
+            <div className="text-[11px] text-slate-400">Master Developer Dashboard</div>
+          </div>
+        </div>
+        <div className="flex items-center gap-2">
+          <button onClick={() => setShowChangePassword(true)} className="text-xs px-3 py-1.5 rounded-lg border border-slate-700 text-slate-300 hover:bg-slate-800">Change Password</button>
+          <button onClick={() => { lockSession(); onLock(); }} className="text-xs px-3 py-1.5 rounded-lg border border-slate-700 text-slate-300 hover:bg-slate-800">Lock</button>
+        </div>
+      </div>
+
+      <div className="px-4 md:px-8 pt-4 flex gap-2 border-b border-slate-800 overflow-x-auto">
+        {TABS_DEV.map(t => (
+          <button key={t.id} onClick={() => setTab(t.id)} className={"flex items-center gap-1.5 text-xs font-medium px-3 py-2 rounded-t-lg whitespace-nowrap " + (tab === t.id ? "bg-slate-900 text-white border border-slate-800 border-b-slate-900" : "text-slate-400 hover:text-slate-200")}>
+            <span>{t.icon}</span>{t.label}
+            {t.id === "requests" && pendingRequests.length > 0 && <span className="text-[10px] bg-amber-500 text-slate-900 font-bold rounded-full px-1.5 leading-4">{pendingRequests.length}</span>}
+          </button>
+        ))}
+      </div>
+
+      <div className="p-4 md:p-8 max-w-6xl">
+        {!CLOUD_ENABLED && (
+          <div className="mb-5 bg-amber-950/40 border border-amber-800 rounded-xl p-4 text-xs text-amber-300">
+            Cloud Sync isn't reachable from this browser right now (Firebase failed to load or is blocked). Keys generated below still work — clients validate them purely offline — but Clients, Overview stats, remote plan/status control, and the Activity Log need a working connection to the shared project.
+          </div>
+        )}
+
+        {tab === "overview" && (
+          <div className="space-y-5">
+            <div className="grid sm:grid-cols-2 lg:grid-cols-5 gap-4">
+              <StatCard label="Total Shops" value={totalShops} sub={blockedCount ? blockedCount + " blocked" : "all active"} />
+              <StatCard label="Free vs Premium" value={freeCount + " / " + premiumCount} sub="free / premium+trial (non-expired)" />
+              <StatCard label="Active Licenses" value={premiumCount} sub="paid plans currently valid" />
+              <StatCard label="Total Revenue" value={"Rs " + recordedRevenue.toLocaleString()} sub="manually recorded via Edit \u2192 Record a Payment" />
+              <StatCard label="Estimated Revenue" value={"Rs " + (revenuePrice * premiumCount).toLocaleString()} sub="not real payment data \u2014 a calculator">
+                <div className="mt-2 flex items-center gap-1.5">
+                  <span className="text-[11px] text-slate-500">Price / paid client:</span>
+                  <input type="number" min="0" value={revenuePrice} onChange={e => updateRevenuePrice(e.target.value)} className="w-20 text-xs border border-slate-700 bg-slate-950 text-slate-200 rounded px-2 py-1 focus:outline-none focus:ring-2 focus:ring-amber-500/50" />
+                </div>
+              </StatCard>
+            </div>
+            <div className="bg-slate-900 border border-slate-800 rounded-xl p-5">
+              <h3 className="text-sm font-semibold text-white mb-3">Quick Actions</h3>
+              <div className="flex flex-wrap gap-2">
+                <button onClick={openAdd} className="text-xs px-3 py-2 rounded-lg bg-amber-500 hover:bg-amber-400 text-slate-900 font-semibold">+ Add New Client</button>
+                <button onClick={() => setTab("clients")} className="text-xs px-3 py-2 rounded-lg border border-slate-700 text-slate-300 hover:bg-slate-800">View All Clients</button>
+                <button onClick={() => setTab("logs")} className="text-xs px-3 py-2 rounded-lg border border-slate-700 text-slate-300 hover:bg-slate-800">View Activity Log</button>
+              </div>
+            </div>
+            {!CLOUD_ENABLED ? null : loadingClients ? (
+              <div className="text-xs text-slate-500">Loading\u2026</div>
+            ) : (
+              <div className="bg-slate-900 border border-slate-800 rounded-xl p-5">
+                <h3 className="text-sm font-semibold text-white mb-3">Recent Activity</h3>
+                {auditLog.length === 0 ? <div className="text-xs text-slate-500">No activity recorded yet \u2014 check the Activity Log tab.</div> : (
+                  <div className="space-y-2">
+                    {auditLog.slice(0, 5).map(l => (
+                      <div key={l.id} className="text-xs flex items-center justify-between gap-3 border-t border-slate-800 pt-2 first:border-t-0 first:pt-0">
+                        <span className="text-slate-300">{l.action}{l.shopName ? " \u2014 " + l.shopName : ""}</span>
+                        <span className="text-slate-500 whitespace-nowrap">{new Date(l.timestamp).toLocaleString()}</span>
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+            )}
+          </div>
+        )}
+
+        {tab === "clients" && (
+          <div className="space-y-5">
+            <div className="flex items-center justify-between flex-wrap gap-2">
+              <div>
+                <h3 className="text-sm font-semibold text-white">Clients & Shops</h3>
+                <p className="text-[11px] text-slate-500">All registered client shops \u2014 edit their plan, suspend access, or remove them.</p>
+              </div>
+              <div className="flex gap-2">
+                {CLOUD_ENABLED && <button onClick={refreshClients} disabled={loadingClients} className="text-xs px-3 py-1.5 rounded-lg border border-slate-700 text-slate-300 hover:bg-slate-800 disabled:opacity-50">{loadingClients ? "Refreshing\u2026" : "Refresh"}</button>}
+                <button onClick={openAdd} className="text-xs px-3 py-1.5 rounded-lg bg-amber-500 hover:bg-amber-400 text-slate-900 font-semibold">+ Add Client</button>
+              </div>
+            </div>
+
+            {!CLOUD_ENABLED ? (
+              <div className="text-xs text-slate-400">Cloud Sync isn't reachable from this browser right now \u2014 see the notice above.</div>
+            ) : (
+              <div className="bg-slate-900 border border-slate-800 rounded-xl p-5">
+                {clients.length === 0 ? (
+                  <div className="text-xs text-slate-500">{loadingClients ? "Loading\u2026" : "No clients yet \u2014 use \u201c+ Add Client\u201d to onboard your first shop."}</div>
+                ) : (
+                  <div className="overflow-x-auto">
+                    <table className="w-full text-xs">
+                      <thead className="text-slate-500 uppercase"><tr><th className="text-left py-1.5 pr-3">Shop Name</th><th className="text-left py-1.5 pr-3">Owner Username</th><th className="text-left py-1.5 pr-3">Business Type</th><th className="text-left py-1.5 pr-3">Tier</th><th className="text-left py-1.5 pr-3">Status</th><th className="text-left py-1.5 pr-3">Expiry</th><th className="text-left py-1.5 pr-3">Actions</th></tr></thead>
+                      <tbody>
+                        {clients.map(row => {
+                          const tb = tierBadge(row);
+                          const sb = statusBadge(row);
+                          const busy = busyBizId === row.bizId;
+                          return (
+                            <tr key={row.id} className="border-t border-slate-800">
+                              <td className="py-2 pr-3 text-slate-200">{row.shopName || row.bizId}</td>
+                              <td className="py-2 pr-3 font-mono text-slate-400">{row.username}{row.username && row.username !== normalizeShopUsername(row.username) && <span title="Saved username won't match what the login screen searches for — open Edit to fix it." className="ml-1.5 text-amber-400 cursor-help">{"\u26A0\uFE0F"}</span>}</td>
+                              <td className="py-2 pr-3 text-slate-400">{businessTypeLabel(row.businessType)}</td>
+                              <td className="py-2 pr-3"><span className={"px-2 py-0.5 rounded-full font-medium " + tb.cls}>{tb.label}</span></td>
+                              <td className="py-2 pr-3"><span className={"px-2 py-0.5 rounded-full font-medium " + sb.cls}>{sb.label}</span></td>
+                              <td className="py-2 pr-3 text-slate-500">{formatDate(row.expiresAt)}</td>
+                              <td className="py-2 pr-3">
+                                <div className="flex flex-wrap gap-1.5">
+                                  <button disabled={busy} onClick={() => setEditRow(row)} className="text-[11px] px-2 py-1 rounded bg-slate-800 hover:bg-slate-700 text-slate-300 disabled:opacity-50">Edit</button>
+                                  <button disabled={busy} onClick={() => suspendToggle(row)} className={"text-[11px] px-2 py-1 rounded disabled:opacity-50 " + (row.blocked ? "bg-emerald-800 hover:bg-emerald-700 text-emerald-100" : "border border-slate-700 text-amber-400 hover:bg-slate-800")}>{row.blocked ? "Activate" : "Suspend"}</button>
+                                  <button disabled={busy} onClick={() => deleteRow(row)} className="text-[11px] px-2 py-1 rounded border border-slate-700 text-rose-400 hover:bg-slate-800 disabled:opacity-50">Delete</button>
+                                </div>
+                              </td>
+                            </tr>
+                          );
+                        })}
+                      </tbody>
+                    </table>
+                  </div>
+                )}
+              </div>
+            )}
+
+            {CLOUD_ENABLED && unregistered.length > 0 && (
+              <div className="bg-slate-900 border border-slate-800 rounded-xl p-5">
+                <h3 className="text-sm font-semibold text-white mb-1">Unregistered Activations</h3>
+                <p className="text-[11px] text-slate-500 mb-3">Shops that activated a generated key on their own, without being added as a managed Client here. Adopt one to give it credentials and full plan control.</p>
+                <div className="overflow-x-auto">
+                  <table className="w-full text-xs">
+                    <thead className="text-slate-500 uppercase"><tr><th className="text-left py-1.5 pr-3">Shop</th><th className="text-left py-1.5 pr-3">Business Type</th><th className="text-left py-1.5 pr-3">Plan</th><th className="text-left py-1.5 pr-3">Actions</th></tr></thead>
+                    <tbody>
+                      {unregistered.map(row => (
+                        <tr key={row.id} className="border-t border-slate-800">
+                          <td className="py-2 pr-3 text-slate-200">{row.bizName || row.bizId}</td>
+                          <td className="py-2 pr-3 text-slate-400">{businessTypeLabel(row.businessType)}</td>
+                          <td className="py-2 pr-3 text-slate-400">{row.isPremium ? "Premium" : "Free"}</td>
+                          <td className="py-2 pr-3"><button onClick={() => openAdopt(row)} className="text-[11px] px-2 py-1 rounded bg-slate-800 hover:bg-slate-700 text-slate-300">Add as Client</button></td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+            )}
+          </div>
+        )}
+
+        {tab === "requests" && (
+          <div className="bg-slate-900 border border-slate-800 rounded-xl p-5">
+            <div className="flex items-center justify-between mb-1">
+              <h3 className="text-sm font-semibold text-white">Plan Requests</h3>
+              {CLOUD_ENABLED && <button onClick={refreshPlanRequests} disabled={loadingRequests} className="text-xs px-3 py-1.5 rounded-lg border border-slate-700 text-slate-300 hover:bg-slate-800 disabled:opacity-50">{loadingRequests ? "Refreshing\u2026" : "Refresh"}</button>}
+            </div>
+            <p className="text-[11px] text-slate-500 mb-4">Plans shops have requested from their own app's Settings \u2192 License &amp; Subscription screen. Approving grants the plan immediately, the same as editing a client directly.</p>
+            {planRequests.length === 0 ? (
+              <div className="text-xs text-slate-500">{loadingRequests ? "Loading\u2026" : "No plan requests yet."}</div>
+            ) : (
+              <div className="space-y-2">
+                {planRequests.map(req => {
+                  const onboarded = clientBizIds.has(req.bizId);
+                  const durationLabel = (DURATION_OPTIONS.find(o => o.id === req.requestedDuration) || {}).label || req.requestedDuration;
+                  return (
+                    <div key={req.id} className="bg-slate-800/50 border border-slate-800 rounded-lg px-3 py-2.5">
+                      <div className="flex items-center justify-between flex-wrap gap-2">
+                        <div>
+                          <div className="text-sm text-slate-200 font-medium">{req.bizName || req.bizId}</div>
+                          <div className="text-[11px] text-slate-500">
+                            Requested <span className="text-amber-400">{capitalize(req.requestedTier)}</span>{durationLabel ? " \u00b7 " + durationLabel : ""} \u00b7 {new Date(req.requestedAt).toLocaleString()}
+                          </div>
+                          {req.note && <div className="text-[11px] text-slate-400 mt-1">\u201c{req.note}\u201d</div>}
+                        </div>
+                        <div className="flex items-center gap-2">
+                          {req.status === "pending" ? (
+                            onboarded ? (
+                              <>
+                                <button disabled={busyRequestId === req.id} onClick={() => resolveRequest(req, true)} className="text-[11px] px-2.5 py-1.5 rounded bg-emerald-800 hover:bg-emerald-700 text-emerald-100 disabled:opacity-50">Approve</button>
+                                <button disabled={busyRequestId === req.id} onClick={() => resolveRequest(req, false)} className="text-[11px] px-2.5 py-1.5 rounded bg-slate-800 hover:bg-slate-700 text-slate-300 disabled:opacity-50">Decline</button>
+                              </>
+                            ) : (
+                              <>
+                                <span className="text-[11px] text-amber-400">Not yet a Client</span>
+                                <button onClick={() => openAdopt({ bizId: req.bizId, bizName: req.bizName, businessType: "mobile_shop", isPremium: false })} className="text-[11px] px-2.5 py-1.5 rounded bg-slate-800 hover:bg-slate-700 text-slate-300">Add as Client</button>
+                                <button disabled={busyRequestId === req.id} onClick={() => resolveRequest(req, false)} className="text-[11px] px-2.5 py-1.5 rounded border border-slate-700 text-slate-400 hover:bg-slate-800 disabled:opacity-50">Decline</button>
+                              </>
+                            )
+                          ) : (
+                            <span className={"text-[11px] font-semibold px-2 py-1 rounded-full " + (req.status === "approved" ? "bg-emerald-900/60 text-emerald-300" : "bg-rose-900/60 text-rose-300")}>{capitalize(req.status)}</span>
+                          )}
+                        </div>
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+          </div>
+        )}
+
+        {tab === "features" && (
+          <div className="bg-slate-900 border border-slate-800 rounded-xl p-5">
+            <div className="flex items-center justify-between mb-1">
+              <h3 className="text-sm font-semibold text-white">Feature Control \u2014 Free vs Paid</h3>
+              {CLOUD_ENABLED && <button onClick={refreshFeatureFlags} disabled={loadingFeatures} className="text-xs px-3 py-1.5 rounded-lg border border-slate-700 text-slate-300 hover:bg-slate-800 disabled:opacity-50">{loadingFeatures ? "Refreshing\u2026" : "Refresh"}</button>}
+            </div>
+            <p className="text-[11px] text-slate-500 mb-4">Check which features are on for Free users and which are on for Paid users \u2014 no fixed list. This is the global default; override any single feature for one shop from that shop's Edit modal in Clients & Shops.</p>
+            {!CLOUD_ENABLED && <div className="mb-4 text-[11px] text-amber-400">Cloud Sync isn't reachable right now \u2014 showing your last-saved values from this browser; Save will retry once it's back.</div>}
+            <div className="overflow-x-auto">
+              <table className="w-full text-sm">
+                <thead className="text-slate-500 uppercase text-[11px]"><tr><th className="text-left py-2 pr-3">Feature</th><th className="text-center py-2 px-3">Free</th><th className="text-center py-2 px-3">Paid</th></tr></thead>
+                <tbody>
+                  {FEATURE_DEFS.map(f => (
+                    <tr key={f.id} className="border-t border-slate-800">
+                      <td className="py-2 pr-3 text-slate-200">{f.label}</td>
+                      <td className="py-2 px-3 text-center"><Checkbox checked={!!featureFlags[f.id] && !!featureFlags[f.id].free} onChange={() => toggleFeature(f.id, "free")} /></td>
+                      <td className="py-2 px-3 text-center"><Checkbox checked={!!featureFlags[f.id] && !!featureFlags[f.id].paid} onChange={() => toggleFeature(f.id, "paid")} /></td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+            <div className="flex items-center gap-3 mt-4">
+              <button disabled={savingFeatures || !featuresDirty} onClick={doSaveFeatureFlags} className="bg-amber-500 hover:bg-amber-400 disabled:opacity-50 text-slate-900 text-sm font-semibold px-4 py-2.5 rounded-lg">{savingFeatures ? "Saving\u2026" : "Save Changes"}</button>
+              {featuresSaved && <span className="text-xs text-emerald-400">Saved \u2713</span>}
+              {featuresDirty && !savingFeatures && <span className="text-xs text-amber-400">Unsaved changes</span>}
+            </div>
+          </div>
+        )}
+
+        {tab === "keys" && (
+          <div className="space-y-5">
+            <div className="bg-slate-900 border border-slate-800 rounded-xl p-5">
+              <h3 className="text-sm font-semibold text-white mb-3">Generate a License Key</h3>
+              <p className="text-[11px] text-slate-500 mb-3">For a shop with Cloud Sync disabled entirely, or a reseller \u2014 they activate it themselves under Settings &rarr; License &amp; Subscription. For a managed Client, add/edit their plan from the Clients &amp; Shops tab instead so it reaches them automatically.</p>
+              <div className="flex flex-wrap gap-2 mb-3">
+                {VALIDITY_OPTIONS.map(o => (
+                  <button key={o.id} onClick={() => setValidity(o.id)} className={"text-xs font-medium px-3 py-2 rounded-lg border " + (validity === o.id ? "bg-amber-500 border-amber-500 text-slate-900" : "border-slate-700 text-slate-300 hover:bg-slate-800")}>{o.label}</button>
+                ))}
+              </div>
+              <div className="max-w-sm mb-3">
+                <Field label="Note (optional — e.g. client name, for your own reference)"><TextInput value={note} onChange={e => setNote(e.target.value)} placeholder="e.g. Ali Traders, Lahore" /></Field>
+              </div>
+              <button onClick={doGenerate} className="bg-amber-500 hover:bg-amber-400 text-slate-900 text-sm font-semibold px-4 py-2.5 rounded-lg">Generate Key</button>
+
+              {justGenerated && (
+                <div className="mt-4 bg-emerald-950/40 border border-emerald-800 rounded-lg p-3 flex items-center justify-between gap-3 flex-wrap">
+                  <div>
+                    <div className="font-mono text-emerald-300 text-sm">{justGenerated.key}</div>
+                    <div className="text-[11px] text-emerald-500/80">{justGenerated.label}{justGenerated.note ? " \u00b7 " + justGenerated.note : ""}</div>
+                  </div>
+                  <button onClick={() => copyKey(justGenerated.key)} className="text-xs px-3 py-1.5 rounded-lg bg-emerald-800 hover:bg-emerald-700 text-emerald-100">{copiedKey === justGenerated.key ? "Copied!" : "Copy"}</button>
+                </div>
+              )}
+            </div>
+
+            <div className="bg-slate-900 border border-slate-800 rounded-xl p-5">
+              <h3 className="text-sm font-semibold text-white mb-3">Keys Generated From This Browser</h3>
+              {keysLog.length === 0 ? (
+                <div className="text-xs text-slate-500">No keys generated yet.</div>
+              ) : (
+                <div className="overflow-x-auto">
+                  <table className="w-full text-xs">
+                    <thead className="text-slate-500 uppercase"><tr><th className="text-left py-1.5 pr-3">Key</th><th className="text-left py-1.5 pr-3">Validity</th><th className="text-left py-1.5 pr-3">Note</th><th className="text-left py-1.5 pr-3">Generated</th><th></th></tr></thead>
+                    <tbody>
+                      {keysLog.map(k => (
+                        <tr key={k.key} className="border-t border-slate-800">
+                          <td className="py-1.5 pr-3 font-mono text-slate-200">{k.key}</td>
+                          <td className="py-1.5 pr-3 text-slate-400">{k.label}</td>
+                          <td className="py-1.5 pr-3 text-slate-400">{k.note || "-"}</td>
+                          <td className="py-1.5 pr-3 text-slate-500">{new Date(k.generatedAt).toLocaleDateString()}</td>
+                          <td className="py-1.5"><button onClick={() => copyKey(k.key)} className="text-[11px] px-2 py-1 rounded bg-slate-800 hover:bg-slate-700 text-slate-300">{copiedKey === k.key ? "Copied!" : "Copy"}</button></td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              )}
+            </div>
+          </div>
+        )}
+
+        {tab === "logs" && (
+          <div className="bg-slate-900 border border-slate-800 rounded-xl p-5">
+            <div className="flex items-center justify-between mb-1">
+              <h3 className="text-sm font-semibold text-white">Activity Log</h3>
+              {CLOUD_ENABLED && <button onClick={refreshAuditLog} disabled={loadingLog} className="text-xs px-3 py-1.5 rounded-lg border border-slate-700 text-slate-300 hover:bg-slate-800 disabled:opacity-50">{loadingLog ? "Refreshing\u2026" : "Refresh"}</button>}
+            </div>
+            <p className="text-[11px] text-slate-500 mb-4">Recent actions taken from this dashboard \u2014 key generation, client changes, suspensions, and more. Kept for your own audit trail.</p>
+            {auditLog.length === 0 ? (
+              <div className="text-xs text-slate-500">{loadingLog ? "Loading\u2026" : "No activity recorded yet."}</div>
+            ) : (
+              <div className="overflow-x-auto">
+                <table className="w-full text-xs">
+                  <thead className="text-slate-500 uppercase"><tr><th className="text-left py-1.5 pr-3">When</th><th className="text-left py-1.5 pr-3">Action</th><th className="text-left py-1.5 pr-3">Shop</th><th className="text-left py-1.5 pr-3">Detail</th></tr></thead>
+                  <tbody>
+                    {auditLog.map(l => (
+                      <tr key={l.id} className="border-t border-slate-800">
+                        <td className="py-1.5 pr-3 text-slate-500 whitespace-nowrap">{new Date(l.timestamp).toLocaleString()}</td>
+                        <td className="py-1.5 pr-3 text-slate-200">{l.action}</td>
+                        <td className="py-1.5 pr-3 text-slate-400">{l.shopName || "\u2014"}</td>
+                        <td className="py-1.5 pr-3 text-slate-500">{l.detail || "\u2014"}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            )}
+          </div>
+        )}
+      </div>
+
+      {showAddModal && <AddClientModal prefill={addPrefill} onClose={() => setShowAddModal(false)} onCreated={refreshClients} />}
+      {editRow && <EditClientModal row={editRow} featureFlags={featureFlags} onClose={() => setEditRow(null)} onSaved={refreshClients} />}
+      {showChangePassword && <ChangePasswordModal onClose={() => setShowChangePassword(false)} />}
+    </div>
+  );
+}
+
+function App() {
+  const [unlocked, setUnlocked] = useState(() => isUnlocked());
+  if (!unlocked) return <PasswordGate onUnlock={() => setUnlocked(true)} />;
+  return <Dashboard onLock={() => setUnlocked(false)} />;
+}
+
+ReactDOM.createRoot(document.getElementById("root")).render(<App />);
+</script>
+</body>
+</html>
